@@ -1,0 +1,40 @@
+{
+  "upstream": {
+    "repo": "cline/cline",
+    "branch": "dev",
+    "remote": "upstream"
+  },
+  "fork": {
+    "repo": "TEA-ching/cline",
+    "branch": "keypool-live",
+    "remote": "origin"
+  },
+  "workingDir": "/path/to/your/local/TEA-ching-cline-clone",
+  "sync": {
+    "maxCommitsPerRun": 20,
+    "initialFetchDepth": 200,
+    "maxFetchDepth": 4000,
+    "batchSize": 5,
+    "dryRun": true,
+    "createPullRequest": true,
+    "branchPrefix": "sync/upstream-"
+  },
+  "models": {
+    "fast": "mistral/devstral-latest",
+    "powerful": "mistral/magistral-medium-latest"
+  },
+  "validation": {
+    "low": [
+      "npm run typecheck"
+    ],
+    "medium": [
+      "npm run typecheck",
+      "npm run test:unit"
+    ],
+    "high": [
+      "npm run typecheck",
+      "npm run test:unit",
+      "npm run compile"
+    ]
+  }
+}

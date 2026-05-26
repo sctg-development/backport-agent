@@ -1,0 +1,314 @@
+/**
+ * @file git/git-tools.ts
+ *
+ * Factory that creates the agent tools wrapping all low-level git operations.
+ *
+ * Each tool returned by `makeGitTools` corresponds to a single capability that
+ * the LLM can invoke during the sync workflow:
+ *
+ *  1. `fetch_remotes`          — update local refs from upstream and fork.
+ *  2. `list_candidate_commits` — discover which upstream commits to sync.
+ *  3. `get_commit_details`     — inspect changed files and full diff.
+ *  4. `create_sync_branch`     — branch off the fork tip for this sync run.
+ *  5. `cherry_pick_commit`     — apply a single commit; reports conflicts.
+ *  6. `abort_cherry_pick`      — abandon a conflicting cherry-pick.
+ *  7. `get_conflict_context`   — fetch fork, upstream, and marker-annotated versions.
+ *  8. `apply_resolved_file`    — write the LLM's resolution and stage it.
+ *  9. `continue_cherry_pick`   — complete the cherry-pick after all files resolved.
+ * 10. `push_sync_branch`       — publish the sync branch to the fork remote.
+ *
+ * All tools respect the `sync.dryRun` flag by returning early with a `dryRun:true`
+ * marker instead of performing any mutating operation.
+ */
+
+import { z } from "zod"
+import { readFileSync } from "node:fs"
+import { defineTool } from "../tool-helper.js"
+import {
+    ensureMergeBase,
+    listCandidateCommits,
+    getCommitChangedFiles,
+    getCommitDiff,
+    createSyncBranch,
+    cherryPick,
+    abortCherryPick,
+    getFileAtRef,
+    writeAndStageFile,
+    continueCherryPick,
+    pushBranch,
+    fetchRemotes,
+} from "./git-client.js"
+import type { SyncConfig } from "../config/schema.js"
+
+/**
+ * Builds and returns all git-related agent tools pre-bound to the provided config.
+ *
+ * The returned array is spread directly into the `Agent` constructor's `tools`
+ * array.  Each tool captures `workingDir`, `upstream`, `fork`, and `sync` from
+ * the config via closure, so callers never need to pass them per-invocation.
+ *
+ * @param config - Validated `SyncConfig` loaded from `config.json`.
+ * @returns Array of ten agent tools covering the full git workflow.
+ */
+export function makeGitTools(config: SyncConfig) {
+  // Destructure frequently-used config sections for brevity inside each tool.
+  const { workingDir, upstream, fork, sync } = config
+
+  /**
+   * Tool: fetch_remotes
+   *
+   * Fetches the upstream and fork remotes at `sync.initialFetchDepth`, then
+   * calls `ensureMergeBase` to deepen the clone if needed.  This must be called
+   * once at the start of every run before any other git tool.
+   */
+  const fetchRemotesTool = defineTool({
+    name: "fetch_remotes",
+    description: "Fetch both upstream and fork remotes to ensure local refs are up to date.",
+    inputSchema: z.object({}),
+    execute: async () => {
+      // Fetch both remotes at the configured initial depth.
+      fetchRemotes(workingDir, upstream.remote, fork.remote, sync.initialFetchDepth)
+      // Deepen the clone as needed so that merge-base computation succeeds.
+      ensureMergeBase(
+        workingDir,
+        `${upstream.remote}/${upstream.branch}`,
+        `${fork.remote}/${fork.branch}`,
+        sync.maxFetchDepth,
+      )
+      return { success: true }
+    },
+  })
+
+  /**
+   * Tool: list_candidate_commits
+   *
+   * Uses `git cherry` to compare upstream and fork by patch content.  Commits
+   * that have already been applied (even with a different SHA) are excluded.
+   * The result is limited to `sync.maxCommitsPerRun` to prevent the agent from
+   * processing an unbounded queue in a single session.
+   */
+  const listCandidatesTool = defineTool({
+    name: "list_candidate_commits",
+    description:
+      "List upstream commits that are not yet applied to the fork branch. " +
+      "Uses git cherry to detect already-applied patches by content, not just SHA. " +
+      "Returns an array of candidate commits with their SHA, subject, and alreadyApplied flag.",
+    inputSchema: z.object({}),
+    execute: async () => {
+      const candidates = listCandidateCommits(
+        workingDir,
+        `${upstream.remote}/${upstream.branch}`,
+        `${fork.remote}/${fork.branch}`,
+      )
+      // Filter out already-applied commits and cap to the configured run limit.
+      const pending = candidates.filter((c) => !c.alreadyApplied).slice(0, sync.maxCommitsPerRun)
+      return { candidates: pending, total: pending.length }
+    },
+  })
+
+  /**
+   * Tool: get_commit_details
+   *
+   * Returns the file list and (optionally) the full diff for a given commit SHA.
+   * The diff is truncated at 32 000 characters by `getCommitDiff` to protect
+   * the LLM context window.  The agent should call this before risk classification
+   * and before attempting a cherry-pick.
+   */
+  const getCommitDetailsTool = defineTool({
+    name: "get_commit_details",
+    description:
+      "Get the changed files and diff for a specific upstream commit. " +
+      "Use this before classifying risk or attempting a cherry-pick.",
+    inputSchema: z.object({
+      sha: z.string().describe("The commit SHA to inspect"),
+      /** Set to false to skip the diff and only retrieve the file list. */
+      includeDiff: z.boolean().default(true),
+    }),
+    execute: async ({ sha, includeDiff }) => {
+      const changedFiles = getCommitChangedFiles(workingDir, sha)
+      // Fetch the diff only when explicitly requested to save context tokens.
+      const diff = includeDiff ? getCommitDiff(workingDir, sha) : null
+      return { sha, changedFiles, diff }
+    },
+  })
+
+  /**
+   * Tool: create_sync_branch
+   *
+   * Creates a new local branch named `<branchPrefix><upstreamBranch>-<date>`
+   * branching off `<forkRemote>/<forkBranch>`.  No-ops in dry-run mode.
+   * The branch name is returned so subsequent tools can reference it.
+   */
+  const createSyncBranchTool = defineTool({
+    name: "create_sync_branch",
+    description:
+      "Create a new sync branch from the fork branch tip. " +
+      "The branch name is auto-generated with today's date. Returns the branch name.",
+    inputSchema: z.object({}),
+    execute: async () => {
+      // Skip actual branch creation in dry-run mode.
+      if (sync.dryRun) return { branchName: null, dryRun: true }
+      // Build the branch name from the configured prefix, upstream branch, and today's date.
+      const date = new Date().toISOString().slice(0, 10)
+      const branchName = `${sync.branchPrefix}${upstream.branch}-${date}`
+      createSyncBranch(workingDir, branchName, `${fork.remote}/${fork.branch}`)
+      return { branchName }
+    },
+  })
+
+  /**
+   * Tool: cherry_pick_commit
+   *
+   * Attempts to cherry-pick the given SHA.  On success, the commit is already
+   * committed to the local branch.  On conflict, git leaves the cherry-pick in
+   * progress; the agent should call `get_conflict_context` / `apply_resolved_file`
+   * / `continue_cherry_pick` in sequence, or `abort_cherry_pick` to give up.
+   */
+  const cherryPickCommitTool = defineTool({
+    name: "cherry_pick_commit",
+    description:
+      "Attempt to cherry-pick a single upstream commit onto the current sync branch. " +
+      "Returns success:true if clean, or success:false with conflictedFiles if conflicts arose. " +
+      "On conflict, the cherry-pick is left in progress for the resolve_conflict tool.",
+    inputSchema: z.object({
+      sha: z.string().describe("Upstream commit SHA to cherry-pick"),
+    }),
+    execute: async ({ sha }) => {
+      // Dry-run: report success without touching the repository.
+      if (sync.dryRun) return { success: true, dryRun: true, conflictedFiles: [] }
+      return cherryPick(workingDir, sha)
+    },
+  })
+
+  /**
+   * Tool: abort_cherry_pick
+   *
+   * Calls `git cherry-pick --abort` to discard any partially applied changes and
+   * restore the working tree to the state before the cherry-pick started.  Should
+   * be called when the agent decides a conflict is too complex to resolve safely.
+   */
+  const abortCherryPickTool = defineTool({
+    name: "abort_cherry_pick",
+    description: "Abort the current cherry-pick in progress. Call this when a conflict cannot be resolved automatically.",
+    inputSchema: z.object({}),
+    execute: async () => {
+      abortCherryPick(workingDir)
+      return { aborted: true }
+    },
+  })
+
+  /**
+   * Tool: get_conflict_context
+   *
+   * Returns three views of a conflicted file so the LLM has all the information
+   * it needs for a principled resolution:
+   *  - `forkVersion`     — the file as it existed in HEAD before the cherry-pick.
+   *  - `upstreamVersion` — the file as it exists in CHERRY_PICK_HEAD (incoming).
+   *  - `withMarkers`     — the current working-tree content with `<<<<<<<` markers.
+   *
+   * `forkVersion` or `upstreamVersion` may be `null` if the file is new on one side.
+   */
+  const getConflictContextTool = defineTool({
+    name: "get_conflict_context",
+    description:
+      "For a conflicted file, return the fork version (HEAD), the upstream version (CHERRY_PICK_HEAD), " +
+      "and the current file content with conflict markers. Use this to gather context before resolving.",
+    inputSchema: z.object({
+      filePath: z.string().describe("Repo-relative path of the conflicted file"),
+    }),
+    execute: async ({ filePath }) => {
+      // Fetch the fork's current committed version (may be null for new files).
+      const forkVersion = getFileAtRef(workingDir, "HEAD", filePath)
+      // Fetch the incoming upstream version (may be null for deleted files).
+      const upstreamVersion = getFileAtRef(workingDir, "CHERRY_PICK_HEAD", filePath)
+      // Read the working-tree file which contains conflict markers.
+      let withMarkers: string | null = null
+      try {
+        withMarkers = readFileSync(`${workingDir}/${filePath}`, "utf-8")
+      } catch {
+        // The file may have been deleted by the upstream commit.
+        withMarkers = null
+      }
+      return { filePath, forkVersion, upstreamVersion, withMarkers }
+    },
+  })
+
+  /**
+   * Tool: apply_resolved_file
+   *
+   * Writes the LLM-provided resolution for a single conflicted file to disk and
+   * runs `git add` to stage it.  Must be called for every conflicted file before
+   * `continue_cherry_pick`.  The `resolvedContent` must be free of conflict markers.
+   */
+  const applyResolvedFileTool = defineTool({
+    name: "apply_resolved_file",
+    description:
+      "Write the resolved content for a conflicted file and stage it. " +
+      "Call this for each conflicted file before calling continue_cherry_pick.",
+    inputSchema: z.object({
+      filePath: z.string().describe("Repo-relative path of the file"),
+      resolvedContent: z.string().describe("The fully resolved file content, with no conflict markers"),
+    }),
+    execute: async ({ filePath, resolvedContent }) => {
+      // Skip file write in dry-run mode.
+      if (sync.dryRun) return { staged: false, dryRun: true }
+      writeAndStageFile(workingDir, filePath, resolvedContent)
+      return { staged: true, filePath }
+    },
+  })
+
+  /**
+   * Tool: continue_cherry_pick
+   *
+   * Finalises the cherry-pick after all conflicted files have been resolved and
+   * staged.  Internally calls `git cherry-pick --continue --no-edit` with
+   * `GIT_EDITOR=true` so that no interactive editor is opened.
+   */
+  const continueCherryPickTool = defineTool({
+    name: "continue_cherry_pick",
+    description:
+      "Complete the cherry-pick after all conflicted files have been resolved and staged via apply_resolved_file.",
+    inputSchema: z.object({}),
+    execute: async () => {
+      // Skip in dry-run mode.
+      if (sync.dryRun) return { committed: false, dryRun: true }
+      continueCherryPick(workingDir)
+      return { committed: true }
+    },
+  })
+
+  /**
+   * Tool: push_sync_branch
+   *
+   * Pushes the named sync branch to `fork.remote`.  Called once after all commits
+   * have been processed.  Only a non-force push is performed to avoid overwriting
+   * human commits on the remote.
+   */
+  const pushSyncBranchTool = defineTool({
+    name: "push_sync_branch",
+    description: "Push the current sync branch to the fork remote.",
+    inputSchema: z.object({
+      /** Name of the local sync branch to push, as returned by `create_sync_branch`. */
+      branchName: z.string(),
+    }),
+    execute: async ({ branchName }) => {
+      // Skip push in dry-run mode.
+      if (sync.dryRun) return { pushed: false, dryRun: true }
+      pushBranch(workingDir, fork.remote, branchName)
+      return { pushed: true, branchName }
+    },
+  })
+
+  return [
+    fetchRemotesTool,
+    listCandidatesTool,
+    getCommitDetailsTool,
+    createSyncBranchTool,
+    cherryPickCommitTool,
+    abortCherryPickTool,
+    getConflictContextTool,
+    applyResolvedFileTool,
+    continueCherryPickTool,
+    pushSyncBranchTool,
+  ]
+}

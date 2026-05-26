@@ -1,0 +1,44 @@
+customizations:
+  - id: keypoollive-provider-vscode
+    description: |
+      keypoollive LLM provider integration dans l'extension VS Code.
+      Fournit la rotation automatique de clés via KEYPOOL_VAULT_URL.
+    paths:
+      - "apps/vscode/src/shared/providers/keypoollive*"
+      - "apps/vscode/src/api/providers/keypoollive*"
+    invariants:
+      - "keypoollive est listé dans providers.json"
+      - "KEYPOOL_VAULT_URL est chargé correctement"
+      - "les tests unitaires du provider passent"
+
+  - id: keypoollive-provider-sdk
+    description: |
+      keypoollive LLM provider dans le SDK @sctg/cline-sdk.
+    paths:
+      - "sdk/packages/llms/src/providers/vendors/keypoollive.ts"
+      - "sdk/packages/llms/src/providers/vendors/keypoollive*"
+    invariants:
+      - "le provider est exporté dans l'index du package llms"
+      - "apiKey: 'auto' déclenche la récupération du vault"
+
+  - id: package-renaming-sctg
+    description: |
+      Renommage @cline/* → @sctg/cline-* dans le build et la publication npm.
+    paths:
+      - ".github/workflows/**"
+      - "scripts/rename-packages*"
+      - "scripts/publish*"
+    invariants:
+      - "les packages publiés utilisent le prefix @sctg/"
+      - "la CI publie sur le scope sctg et non cline"
+
+  - id: ai-json-vault
+    description: |
+      Fichier ai.json chiffré servant de vault pour les clés API.
+      Ne doit jamais être poussé en clair.
+    paths:
+      - "ai.json"
+      - "ai.json.*.enc"
+    invariants:
+      - "ai.json n'est pas commité en clair (doit être dans .gitignore)"
+      - "ai.json.*.enc est le seul format permis en dépôt public"
