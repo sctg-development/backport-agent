@@ -130,6 +130,20 @@ export const SyncConfigSchema = z.object({
     .default(() => ({} as any)),
 
   /**
+   * Report output settings.
+   */
+  report: z
+    .object({
+      /**
+       * Filesystem directory where the detailed Markdown run report is written.
+       * The file name is `report.<timestamp>.md`.
+       * Defaults to the current working directory (`.`).
+       */
+      destination: z.string().default(".").describe("Directory where detailed run reports are written"),
+    })
+    .default(() => ({} as any)),
+
+  /**
    * Shell command suites executed after cherry-picking, indexed by risk level.
    * Commands must match the allowlist in `validation/commands.ts` or they will
    * be blocked at execution time.

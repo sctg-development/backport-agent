@@ -19,6 +19,18 @@
  * automatic key rotation without storing secrets in the codebase.
  */
 /// <reference types="node" />
+// Load .env file if present — allows setting KEYPOOL_VAULT_URL, KEYPOOL_LIVE_SECRET,
+// BACKPORT_CUSTOMIZATIONS, etc. without modifying the shell environment.
+// Uses Node.js 20.6+ built-in --env-file support via the `dotenv` fallback.
+import { existsSync } from "node:fs"
+import { resolve as resolvePath } from "node:path"
+{
+  const envPath = resolvePath(process.cwd(), ".env")
+  if (existsSync(envPath)) {
+    const { config } = await import("dotenv")
+    config({ path: envPath })
+  }
+}
 import { Agent, createBuiltinTools, createUserInstructionConfigService } from "@sctg/cline-sdk"
 import type { UserInstructionConfigRecord } from "@sctg/cline-sdk"
 import { loadConfig } from "./config/loader.js"
@@ -45,19 +57,28 @@ Produce a draft pull request with a clear report. Never push directly to the mai
 
 1. Call fetch_remotes to ensure refs are up to date.
 2. Call list_candidate_commits to get pending upstream commits (already filtered, newest-last).
-3. For each candidate commit (in order):
+   - Record all returned SHAs immediately. You are accountable for every single one.
+3. For each candidate commit (process ALL of them — no silent skips):
    a. Call get_commit_details to inspect changed files and diff.
    b. Call classify_commit_risk to determine risk level deterministically.
-   c. If risk is "high" and the commit touches a fork customization zone:
-      - Call check_customization_compatibility with the diff and the fork customisations to get a semantic assessment.
-      - Call analyze_commit_for_backport to understand the commit's intent and get a backport recommendation.
-      - If the AI tools suggest review-required or flag semantic conflicts, mark as blocked and add to humanReviewReasons.
-      - If uncertain, mark it as blocked and add to humanReviewReasons.
-   d. Skip commits already applied (alreadyApplied: true).
+   c. Risk-based decision:
+      - LOW risk: proceed directly to step 5 (cherry-pick). No AI analysis needed.
+      - MEDIUM risk: call analyze_commit_for_backport for context, then proceed to cherry-pick.
+      - HIGH risk (touches a customization zone):
+        * MANDATORY: Call check_customization_compatibility — pass the diff and all affected customization IDs.
+        * MANDATORY: Call analyze_commit_for_backport — pass sha, message, diff, and changed files.
+        * Read both responses carefully:
+          - If both tools confirm the change is SAFE or ORTHOGONAL to the customization (e.g., it modifies a
+            different provider, unrelated docs section, or infrastructure that doesn't overlap with fork code):
+            → proceed to cherry-pick (step 5). Do NOT block on risk level alone.
+          - If the tools identify a genuine semantic conflict (same code paths, incompatible invariants):
+            → add to blockedCommits with a precise reason from the AI analysis.
+          - If uncertain: still attempt the cherry-pick; conflicts will surface in step 5c.
+   d. Commits with alreadyApplied: true → record as "skipped" in commitResults.
 4. Create the sync branch via create_sync_branch (once, before first cherry-pick).
-5. For each non-skipped commit (lowest risk first):
+5. For each non-skipped commit (process lowest risk first):
    a. Call cherry_pick_commit.
-   b. If success: proceed to next.
+   b. If success: record as "applied" in commitResults and proceed to next.
    c. If conflicts: for each conflicted file, call get_conflict_context, then attempt resolution.
       - Call resolve_conflict_with_ai with the base/ours/theirs content to get an AI-proposed resolution.
       - If confidence is "high" or "medium": verify no conflict markers remain, then call apply_resolved_file, then continue_cherry_pick.
@@ -69,7 +90,15 @@ Produce a draft pull request with a clear report. Never push directly to the mai
 10. Call generate_report with the full summary of all decisions.
 11. Call create_sync_pr with the report as body (unless an existing PR was found and up to date).
 
+## Accountability (enforced — never skip)
+- You received a finite list of SHAs from list_candidate_commits.
+- EVERY SHA must appear in generate_report: either in commitResults (as applied/skipped/conflict-blocked/validation-failed) OR in blockedCommits.
+- No commit may be silently dropped. If you are unsure what to do with a commit, add it to blockedCommits with reason "deferred: needs human triage".
+- blockedCommits entries MUST include a specific human-readable reason (not just the SHA).
+- Pass allCandidateShas to generate_report — it cross-checks accountability automatically.
+
 ## Hard constraints (never violate)
+- NEVER block a commit solely because classify_commit_risk returns "high" — always run the mandatory AI tools first.
 - NEVER apply a resolved file with conflict markers (<<<, ===, >>>) still present.
 - NEVER call continue_cherry_pick before all conflicted files are staged.
 - NEVER fabricate file content — only use content from get_conflict_context.
@@ -119,8 +148,12 @@ async function main() {
   const riskTool = makeRiskTool(config, customizations) // 1 tool for risk classification
   const validationTool = makeValidationTool(config)     // 1 tool for validation suite
   const githubTools = makeGitHubTools(config)           // 3 tools for GitHub PR management
-  const reportTool = makeReportTool(config)             // 1 terminal tool (completesRun: true)
-  const aiTools = makeAiTools(config)                   // 3 AI-powered analysis tools
+  // Prompt log file for this run — every sub-agent LLM call is appended here.
+  const promptLogPath = resolvePath(`run-${Date.now()}.prompts.jsonl`)
+  process.stderr.write(`[PromptLogger] Writing sub-agent logs to: ${promptLogPath}\n`)
+
+  const reportTool = makeReportTool(config, promptLogPath) // 1 terminal tool (completesRun: true)
+  const aiTools = makeAiTools(config, promptLogPath)       // 3 AI-powered analysis tools
 
   // --- SDK built-in tools ---
   // Add Cline integrated tools so the agent can also perform generic workspace
@@ -192,11 +225,34 @@ async function main() {
 
   // --- Event subscription ---
   // Stream assistant text deltas to stdout so the operator can watch progress.
-  // The event type is inferred via `Parameters<...>` because `AgentRuntimeEvent`
-  // is not part of the public SDK API surface.
+  // Tool-level progress (iterations, tool calls) is gated behind VERBOSE=true to
+  // keep non-verbose runs clean.  Set VERBOSE=true in .env or the shell to enable.
+  const verbose = process.env.VERBOSE === "true"
+  let lastEventWasText = false
   agent.subscribe((event: Parameters<Parameters<typeof agent.subscribe>[0]>[0]) => {
     if (event.type === "assistant-text-delta") {
+      lastEventWasText = true
       process.stdout.write(event.text)
+    } else if (event.type === "tool-started" && verbose) {
+      // Ensure tool log starts on a fresh line after any streamed text.
+      if (lastEventWasText) process.stderr.write("\n")
+      lastEventWasText = false
+      const inp = event.toolCall.input as Record<string, unknown>
+      const preview =
+        inp && typeof inp === "object" && Object.keys(inp).length > 0
+          ? Object.keys(inp)
+              .slice(0, 2)
+              .map((k) => `${k}=${JSON.stringify(inp[k]).slice(0, 60)}`)
+              .join(", ")
+          : "(no input)"
+      process.stderr.write(`[→ iter ${event.iteration}] ${event.toolCall.toolName}(${preview})\n`)
+    } else if (event.type === "tool-finished" && verbose) {
+      lastEventWasText = false
+      const result = event.toolCall as unknown as { toolName: string }
+      process.stderr.write(`[← iter ${event.iteration}] ${result.toolName ?? event.toolCall.toolName} done\n`)
+    } else if ((event.type === "iteration_start" || event.type === "turn-started") && verbose) {
+      const iter = (event as unknown as { iteration?: number }).iteration ?? "?"
+      process.stderr.write(`\n--- iteration ${iter} ---\n`)
     }
   })
 

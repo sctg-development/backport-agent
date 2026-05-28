@@ -23,6 +23,9 @@
     "fast": "mistral/devstral-latest",
     "powerful": "mistral/magistral-medium-latest"
   },
+  "report": {
+    "destination": "."
+  },
   "validation": {
     "low": [
       "npm run typecheck"

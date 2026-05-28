@@ -9,6 +9,7 @@
   "scripts": {
     "start": "tsx src/main.ts",
     "dry-run": "DRY_RUN=true tsx src/main.ts",
+    "dry-run:tea": "DRY_RUN=true BACKPORT_CUSTOMIZATIONS=/Users/rlemeill/Development/tea-ching-cline/.backport-agent/customizations.yaml tsx src/main.ts",
     "typecheck": "tsc --noEmit",
     "build": "tsc --outDir dist",
     "test": "npm run test:unit && npm run test:integration",

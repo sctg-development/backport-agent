@@ -85,6 +85,74 @@ function extractJson<T>(text: string): T {
   return JSON.parse(text.trim()) as T
 }
 
+// ---------------------------------------------------------------------------
+// PromptLogger — records all sub-agent LLM interactions to a JSONL file
+// ---------------------------------------------------------------------------
+
+import { appendFileSync } from "node:fs"
+
+/**
+ * Token usage breakdown from a single sub-agent LLM call.
+ */
+interface TokenUsage {
+  inputTokens: number
+  outputTokens: number
+  cacheReadTokens: number
+  cacheWriteTokens: number
+  totalCost?: number
+}
+
+/**
+ * Appends a single prompt/response record to the run's JSONL log file.
+ *
+ * The log file path is `./run-<timestamp>.prompts.jsonl` (relative to cwd).
+ * It is created on first write and appended on subsequent calls.
+ * Each line is a self-contained JSON object — suitable for streaming analysis
+ * and incremental loading without parsing the entire file.
+ *
+ * @param logPath    - Absolute path to the JSONL log file for this run.
+ * @param toolName   - The backport agent tool that invoked the sub-agent.
+ * @param modelId    - LLM model identifier used for this call.
+ * @param prompt     - Full user prompt sent to the sub-agent.
+ * @param response   - Raw text response received from the sub-agent.
+ * @param durationMs - Wall-clock time for the sub-agent call in milliseconds.
+ * @param error      - Optional error message if the call failed.
+ * @param usage      - Optional token usage breakdown from the LLM response.
+ */
+function logPrompt(
+  logPath: string,
+  toolName: string,
+  modelId: string,
+  prompt: string,
+  response: string,
+  durationMs: number,
+  error?: string | null,
+  usage?: TokenUsage | null,
+): void {
+  const record = {
+    timestamp: new Date().toISOString(),
+    tool: toolName,
+    model: modelId,
+    durationMs,
+    prompt,
+    response,
+    ...(error ? { error } : {}),
+    ...(usage ? {
+      inputTokens: usage.inputTokens,
+      outputTokens: usage.outputTokens,
+      cacheReadTokens: usage.cacheReadTokens,
+      cacheWriteTokens: usage.cacheWriteTokens,
+      ...(usage.totalCost != null ? { totalCost: usage.totalCost } : {}),
+    } : {}),
+  }
+  try {
+    appendFileSync(logPath, JSON.stringify(record) + "\n", "utf8")
+  } catch {
+    // Log write failures are non-fatal — the agent run must not be blocked.
+    process.stderr.write(`[PromptLogger] Warning: could not write to ${logPath}\n`)
+  }
+}
+
 /**
  * Creates a minimal sub-`Agent` configured with the keypoollive provider.
  *
@@ -112,10 +180,12 @@ function makeSubAgent(modelId: string, systemPrompt: string): Agent {
 /**
  * Builds and returns all AI-powered agent tools pre-bound to the provided config.
  *
- * @param config - Validated `SyncConfig` loaded from `config.json`.
+ * @param config  - Validated `SyncConfig` loaded from `config.json`.
+ * @param logPath - Absolute path to the JSONL prompt log file for this run.
+ *                  Created by `main.ts` as `run-<timestamp>.prompts.jsonl`.
  * @returns Array of three agent tools for AI-assisted analysis.
  */
-export function makeAiTools(config: SyncConfig) {
+export function makeAiTools(config: SyncConfig, logPath: string) {
   // -------------------------------------------------------------------------
   // Tool 1: resolve_conflict_with_ai
   // -------------------------------------------------------------------------
@@ -223,7 +293,10 @@ export function makeAiTools(config: SyncConfig) {
 
       try {
         const subAgent = makeSubAgent(config.models.powerful, systemPrompt)
+        const t0 = Date.now()
         const result = await subAgent.run(userPrompt)
+        const durationMs = Date.now() - t0
+        logPrompt(logPath, "resolve_conflict_with_ai", config.models.powerful, userPrompt, result.outputText ?? "", durationMs, null, result.usage)
         const output = extractJson<{
           resolvedContent: string
           confidence: "high" | "medium" | "low"
@@ -238,6 +311,7 @@ export function makeAiTools(config: SyncConfig) {
         }
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err)
+        logPrompt(logPath, "resolve_conflict_with_ai", config.models.powerful, userPrompt, "", 0, message)
         return {
           resolvedContent: "",
           confidence: "low" as const,
@@ -327,7 +401,10 @@ export function makeAiTools(config: SyncConfig) {
 
       try {
         const subAgent = makeSubAgent(config.models.fast, systemPrompt)
+        const t0 = Date.now()
         const result = await subAgent.run(userPrompt)
+        const durationMs = Date.now() - t0
+        logPrompt(logPath, "analyze_commit_for_backport", config.models.fast, userPrompt, result.outputText ?? "", durationMs, null, result.usage)
         const output = extractJson<{
           summary: string
           keyChanges: string[]
@@ -346,6 +423,7 @@ export function makeAiTools(config: SyncConfig) {
         }
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err)
+        logPrompt(logPath, "analyze_commit_for_backport", config.models.fast, userPrompt, "", 0, message)
         return {
           summary: `Analysis failed: ${message}`,
           keyChanges: [],
@@ -462,7 +540,10 @@ export function makeAiTools(config: SyncConfig) {
 
       try {
         const subAgent = makeSubAgent(config.models.fast, systemPrompt)
+        const t0 = Date.now()
         const result = await subAgent.run(userPrompt)
+        const durationMs = Date.now() - t0
+        logPrompt(logPath, "check_customization_compatibility", config.models.fast, userPrompt, result.outputText ?? "", durationMs, null, result.usage)
         const output = extractJson<{
           compatible: boolean
           affectedCustomizations: string[]
@@ -481,6 +562,7 @@ export function makeAiTools(config: SyncConfig) {
         }
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err)
+        logPrompt(logPath, "check_customization_compatibility", config.models.fast, userPrompt, "", 0, message)
         return {
           compatible: false,
           affectedCustomizations: [],
