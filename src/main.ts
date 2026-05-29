@@ -34,6 +34,35 @@
     return argv.includes(name)
   }
 
+  function isHelpRequest(): boolean {
+    return hasFlag("--help") || hasFlag("-h")
+  }
+
+  function printHelp(): void {
+    console.log(`Backport Agent CLI
+
+Usage:
+  backport-agent [options]
+
+Options:
+  --help, -h                     Show this help message
+  --config <path>                Path to config.json
+  --backport-customizations <path|url>  Override customizations source
+  --keypool-vault-url <url>      Override KEYPOOL_VAULT_URL
+  --keypool-live-secret <secret>  Override KEYPOOL_LIVE_SECRET
+  --keypool-state-file <path>    Override KEYPOOL_STATE_FILE
+  --dry-run                      Run without pushing changes
+  --verbose                      Enable verbose logs
+
+Note: config.json is only required for an actual run; this help text works without a config file.
+`)
+  }
+
+  if (isHelpRequest()) {
+    printHelp()
+    process.exit(0)
+  }
+
   if (hasFlag("--verbose")) process.env.VERBOSE = "true"
   if (hasFlag("--dry-run")) process.env.DRY_RUN = "true"
   const cliConfig = getArgValue("--config")
@@ -65,10 +94,12 @@ import { loadConfig } from "./config/loader.js"
 import { loadCustomizations } from "./customizations/loader.js"
 import { makeGitTools } from "./git/git-tools.js"
 import { applyGitAuth, ensureWorkingDir } from "./git/git-init.js"
+import { ensureMergeBase, fetchRemotes, listCandidateCommits } from "./git/git-client.js"
 import { makeRiskTool } from "./risk/risk-tools.js"
 import { makeValidationTool } from "./validation/validation-tools.js"
 import { makeGitHubTools } from "./github/github-tools.js"
 import { makeReportTool } from "./reports/report-tools.js"
+import { buildNoopSyncReport } from "./reports/noop-report.js"
 import { makeAiTools } from "./ai/ai-tools.js"
 
 // ---------------------------------------------------------------------------
@@ -180,6 +211,25 @@ async function main() {
   // remotes if it does, bringing the checkout up to date before the agent starts.
   applyGitAuth(config)
   ensureWorkingDir(config)
+
+  const upstreamRef = `${config.upstream.remote}/${config.upstream.branch}`
+  const forkRef = `${config.fork.remote}/${config.fork.branch}`
+
+  fetchRemotes(config.workingDir, config.upstream.remote, config.fork.remote, config.sync.initialFetchDepth)
+  ensureMergeBase(config.workingDir, upstreamRef, forkRef, config.sync.maxFetchDepth)
+
+  const pendingCommits = listCandidateCommits(config.workingDir, upstreamRef, forkRef)
+    .filter((candidate) => !candidate.alreadyApplied)
+    .slice(0, config.sync.maxCommitsPerRun)
+
+  if (pendingCommits.length === 0) {
+    const dryRunNote = config.sync.dryRun ? " [DRY RUN — no changes will be pushed]" : ""
+    console.error(`\n=== Backport Agent starting${dryRunNote} ===\n`)
+    console.error("No upstream commits pending; skipping agent run.\n")
+    console.error("=== Run complete ===\n")
+    console.log(buildNoopSyncReport({ upstreamRef, forkRef, dryRun: config.sync.dryRun }))
+    return
+  }
 
   const userInstructionService = createUserInstructionConfigService({
     skills: { workspacePath: config.workingDir },
