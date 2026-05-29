@@ -36,6 +36,7 @@ import type { UserInstructionConfigRecord } from "@sctg/cline-sdk"
 import { loadConfig } from "./config/loader.js"
 import { loadCustomizations } from "./customizations/loader.js"
 import { makeGitTools } from "./git/git-tools.js"
+import { applyGitAuth, ensureWorkingDir } from "./git/git-init.js"
 import { makeRiskTool } from "./risk/risk-tools.js"
 import { makeValidationTool } from "./validation/validation-tools.js"
 import { makeGitHubTools } from "./github/github-tools.js"
@@ -136,6 +137,15 @@ async function main() {
   // Both loaders throw descriptive errors if the files are missing or invalid.
   const config = loadConfig()
   const customizations = loadCustomizations()
+
+  // --- Authentication + working directory setup ---
+  // applyGitAuth sets process-level env vars (GIT_SSH_COMMAND or GIT_CONFIG_*)
+  // before any git call is made, so all subsequent operations use the right creds.
+  // ensureWorkingDir clones the fork repo if it doesn't exist, or fetches all
+  // remotes if it does, bringing the checkout up to date before the agent starts.
+  applyGitAuth(config)
+  ensureWorkingDir(config)
+
   const userInstructionService = createUserInstructionConfigService({
     skills: { workspacePath: config.workingDir },
   })
@@ -221,6 +231,9 @@ async function main() {
     apiKey: "auto", // SDK resolves via KEYPOOL_VAULT_URL at invocation time
     systemPrompt: SYSTEM_PROMPT,
     tools: allTools,
+    maxIterations: config.sync.maxIterations,
+    // Prevent the run from ending until generate_report (completesRun: true) is called.
+    completionPolicy: { requireCompletionTool: true },
   })
 
   // --- Event subscription ---
@@ -267,16 +280,71 @@ async function main() {
 
   console.error(`\n=== Backport Agent starting${dryRunNote} ===\n`)
 
+  // --- Provider retry helper ---
+  // The SDK has no built-in retry for HTTP errors from the model provider.
+  // Gemini (and other providers) occasionally return 503 / rate-limit responses;
+  // this wrapper catches those and retries with exponential backoff.
+  // Because agent state is persisted on disk (git), restarting the run is safe —
+  // the agent will detect already-applied commits from the git log.
+  const RETRIABLE_RE = /503|rate.?limit|too many requests|overloaded|service.?unavailable/i
+  const BASE_DELAY_MS = 15_000
+  const MAX_ATTEMPTS = 5
+
+  async function runWithRetry(): Promise<Awaited<ReturnType<typeof agent.run>>> {
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      let result: Awaited<ReturnType<typeof agent.run>>
+      try {
+        result = await agent.run(task)
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err)
+        if (attempt < MAX_ATTEMPTS && RETRIABLE_RE.test(msg)) {
+          const delay = BASE_DELAY_MS * attempt
+          process.stderr.write(
+            `[Retry] Provider error on attempt ${attempt}/${MAX_ATTEMPTS}: ${msg.slice(0, 120)}\n` +
+              `[Retry] Waiting ${delay / 1000}s before retrying...\n`,
+          )
+          await new Promise((r) => setTimeout(r, delay))
+          continue
+        }
+        throw err
+      }
+
+      // The SDK can return without throwing when the model API errors silently
+      // (e.g. invalid model name, 503 absorbed internally). Treat non-completed
+      // status as a throw so the retry loop can handle retriable cases.
+      if (result.status !== "completed") {
+        const err = result.error ?? new Error(`Agent run ended with status "${result.status}" (model API error?)`)
+        const msg = err.message
+        if (attempt < MAX_ATTEMPTS && RETRIABLE_RE.test(msg)) {
+          const delay = BASE_DELAY_MS * attempt
+          process.stderr.write(
+            `[Retry] Silent provider error (status=${result.status}) on attempt ${attempt}/${MAX_ATTEMPTS}: ${msg.slice(0, 120)}\n` +
+              `[Retry] Waiting ${delay / 1000}s before retrying...\n`,
+          )
+          await new Promise((r) => setTimeout(r, delay))
+          continue
+        }
+        throw err
+      }
+
+      return result
+    }
+    throw new Error("unreachable")
+  }
+
   // --- Run the agent ---
   // The agent loop runs until the `generate_report` tool is called
   // (`lifecycle: { completesRun: true }`) or an unrecoverable error occurs.
   try {
-    const result = await agent.run(task)
+    const result = await runWithRetry()
 
     console.error(`\n=== Run complete ===\n`)
     if (result.outputText) {
       // The generate_report tool completes the run; outputText is the Markdown summary.
       console.log(result.outputText)
+    } else {
+      // With requireCompletionTool: true this should never happen on a clean run.
+      throw new Error("Agent run completed but generate_report was never called (empty output). Check the prompt log for details.")
     }
   } finally {
     userInstructionService.stop()
@@ -285,7 +353,9 @@ async function main() {
 
 // Wrap main() in a .catch() handler to ensure the process exits with code 1
 // on any unhandled error, rather than crashing with an unhandled rejection.
-main().catch((err) => {
-  console.error("Fatal error:", err instanceof Error ? err.message : String(err))
-  process.exit(1)
-})
+main()
+  .then(() => process.exit(0))
+  .catch((err) => {
+    console.error("Fatal error:", err instanceof Error ? err.message : String(err))
+    process.exit(1)
+  })

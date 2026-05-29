@@ -1,10 +1,18 @@
 {
+  "auth": {
+    "_comment_ssh": "Use sshKeyPath for SSH remotes (supports ~ expansion)",
+    "sshKeyPath": "~/.ssh/id_ed25519",
+    "_comment_token": "Use githubToken for HTTPS remotes; prefix with $ to read from env var",
+    "_githubToken_example": "$GITHUB_TOKEN"
+  },
   "upstream": {
+    "url": "git@github.com:cline/cline.git",
     "repo": "cline/cline",
     "branch": "dev",
     "remote": "upstream"
   },
   "fork": {
+    "url": "git@github.com:TEA-ching/cline.git",
     "repo": "TEA-ching/cline",
     "branch": "keypool-live",
     "remote": "origin"
