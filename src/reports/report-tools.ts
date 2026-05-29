@@ -98,6 +98,17 @@ function makeReportSubAgent(modelId: string, systemPrompt: string): Agent {
 }
 
 /**
+ * Returns a backtick fence string long enough to safely wrap `content`.
+ * Finds the longest run of consecutive backticks in the content and uses
+ * one more, with a minimum of 3.  This prevents inner ``` from closing the
+ * outer fence and breaking Markdown rendering.
+ */
+function safeFence(content: string): string {
+  const maxRun = Math.max(0, ...(content.match(/`+/g) ?? []).map((s) => s.length))
+  return "`".repeat(Math.max(3, maxRun + 1))
+}
+
+/**
  * Calls the fast model to produce a Mermaid flowchart summarising the agent run.
  * Returns a fenced mermaid code block string, or a fallback placeholder on error.
  */
@@ -377,15 +388,15 @@ export function makeReportTool(config: SyncConfig, promptLogPath: string) {
           "",
           "**Prompt sent to sub-agent:**",
           "",
-          "```",
+          safeFence(e.prompt),
           e.prompt,
-          "```",
+          safeFence(e.prompt),
           "",
           "**Response received:**",
           "",
-          "```",
+          safeFence(e.response || "(empty)"),
           e.response || "(empty)",
-          "```",
+          safeFence(e.response || "(empty)"),
           "",
           "---",
           "",
