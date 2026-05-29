@@ -36,7 +36,7 @@ jobs:
         run: |
           BASE=$(node -p "require('./package.json').version")
           TIMESTAMP=$(date -u +%Y%m%d%H%M%S)
-          echo "version=${BASE}.${TIMESTAMP}" >> "$GITHUB_OUTPUT"
+          echo "version=${BASE}-${TIMESTAMP}" >> "$GITHUB_OUTPUT"
 
       - name: Bump version (no git tag)
         run: npm version "${{ steps.version.outputs.version }}" --no-git-tag-version
