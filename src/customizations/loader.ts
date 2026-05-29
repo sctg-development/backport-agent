@@ -1,16 +1,18 @@
 /**
  * @file customizations/loader.ts
  *
- * Loads and validates the customizations manifest from a YAML file.
+ * Loads and validates the customizations manifest from multiple sources.
  *
- * Resolution order for the manifest path (first match wins):
- *  1. Explicit `customizationsPath` argument passed by the caller.
- *  2. The `BACKPORT_CUSTOMIZATIONS` environment variable.
+ * Resolution order for the manifest (first match wins):
+ *  1. Explicit `source` argument passed by the caller.
+ *     - `string` starting with `http://` or `https://` → fetched via HTTP GET.
+ *     - `string` (other) → read from the local filesystem.
+ *     - `object` → used directly as the parsed manifest (JSON/inline form).
+ *  2. The `BACKPORT_CUSTOMIZATIONS` environment variable (file path).
  *  3. `customizations.yaml` in the current working directory.
  *
- * The file is parsed with `js-yaml` and then validated against
- * `CustomizationsSchema` via Zod.  A `ZodError` is thrown if the structure
- * is invalid, providing a clear description of what is wrong.
+ * The resolved value is parsed with `js-yaml` when it comes from a string/URL,
+ * then validated against `CustomizationsSchema` via Zod.
  */
 
 import { readFileSync } from "node:fs"
@@ -19,22 +21,39 @@ import yaml from "js-yaml"
 import { CustomizationsSchema, type Customizations } from "./schema.js"
 
 /**
- * Read, parse, and validate the customizations YAML manifest.
+ * Read, parse, and validate the customizations manifest.
  *
- * @param customizationsPath - Optional explicit path to a `customizations.yaml` file.
- *                             Falls back to `BACKPORT_CUSTOMIZATIONS` env var,
- *                             then `./customizations.yaml` in the cwd.
+ * @param source - Optional source: a file path, an HTTP(S) URL, or an inline object.
+ *                 Falls back to `BACKPORT_CUSTOMIZATIONS` env var, then `./customizations.yaml`.
  * @returns A fully validated `Customizations` object.
- * @throws {Error} If the file cannot be read.
- * @throws {ZodError} If the YAML structure does not satisfy `CustomizationsSchema`.
+ * @throws {Error} If the file/URL cannot be read.
+ * @throws {ZodError} If the structure does not satisfy `CustomizationsSchema`.
  */
-export function loadCustomizations(customizationsPath?: string): Customizations {
-  // Determine which file to read, in priority order.
-  const path =
-    customizationsPath ?? process.env.BACKPORT_CUSTOMIZATIONS ?? resolve(process.cwd(), "customizations.yaml")
+export async function loadCustomizations(source?: string | Record<string, unknown>): Promise<Customizations> {
+  // --- Inline object: already parsed, validate directly ---
+  if (source !== undefined && typeof source === "object") {
+    return CustomizationsSchema.parse(source)
+  }
 
-  // Parse YAML — js-yaml.load returns `unknown`, so we hand it to Zod for validation.
-  const raw = yaml.load(readFileSync(path, "utf-8"))
+  // --- Resolve string source ---
+  const strSource =
+    source ?? process.env.BACKPORT_CUSTOMIZATIONS ?? resolve(process.cwd(), "customizations.yaml")
+
+  let raw: unknown
+
+  if (typeof strSource === "string" && (strSource.startsWith("http://") || strSource.startsWith("https://"))) {
+    // URL: fetch via HTTP GET
+    const response = await fetch(strSource)
+    if (!response.ok) {
+      throw new Error(`Failed to fetch customizations from ${strSource}: HTTP ${response.status} ${response.statusText}`)
+    }
+    const text = await response.text()
+    raw = yaml.load(text)
+  } else {
+    // Local file path
+    raw = yaml.load(readFileSync(strSource as string, "utf-8"))
+  }
+
   return CustomizationsSchema.parse(raw)
 }
 

@@ -23,6 +23,7 @@
 
 import { z } from "zod"
 import { readFileSync } from "node:fs"
+import { minimatch } from "minimatch"
 import { defineTool } from "../tool-helper.js"
 import {
     ensureMergeBase,
@@ -39,6 +40,37 @@ import {
     fetchRemotes,
 } from "./git-client.js"
 import type { SyncConfig } from "../config/schema.js"
+
+/**
+ * Tests whether a repo-relative file path matches any of the given patterns.
+ *
+ * Patterns are either:
+ * - A glob string (matched via `minimatch` with `matchBase: true`).
+ * - A regex literal in the form `/source/flags` (e.g. `"/^sdk\\/.*\.ts$/i"`).
+ *
+ * @param filePath - Repo-relative path of the file to test.
+ * @param patterns - Array of glob or regex patterns from the config.
+ * @returns `true` if the path matches at least one pattern.
+ */
+function matchesResolvePattern(filePath: string, patterns: string[]): boolean {
+  for (const pattern of patterns) {
+    // Regex literal: /source/flags
+    if (pattern.startsWith("/") && pattern.lastIndexOf("/") > 0) {
+      const lastSlash = pattern.lastIndexOf("/")
+      const source = pattern.slice(1, lastSlash)
+      const flags = pattern.slice(lastSlash + 1)
+      try {
+        if (new RegExp(source, flags).test(filePath)) return true
+      } catch {
+        // Silently skip malformed regex patterns.
+      }
+    } else {
+      // Glob pattern via minimatch.
+      if (minimatch(filePath, pattern, { matchBase: true })) return true
+    }
+  }
+  return false
+}
 
 /**
  * Builds and returns all git-related agent tools pre-bound to the provided config.
@@ -229,7 +261,20 @@ export function makeGitTools(config: SyncConfig) {
         // The file may have been deleted by the upstream commit.
         withMarkers = null
       }
-      return { filePath, forkVersion, upstreamVersion, withMarkers }
+
+      // Deterministic strategy override from config.resolve.
+      // `theirs` is checked first; if a file matches both, theirs wins.
+      let forcedStrategy: "ours" | "theirs" | null = null
+      const resolveConfig = config.resolve
+      if (resolveConfig) {
+        if (matchesResolvePattern(filePath, resolveConfig.theirs ?? [])) {
+          forcedStrategy = "theirs"
+        } else if (matchesResolvePattern(filePath, resolveConfig.ours ?? [])) {
+          forcedStrategy = "ours"
+        }
+      }
+
+      return { filePath, forkVersion, upstreamVersion, withMarkers, forcedStrategy }
     },
   })
 

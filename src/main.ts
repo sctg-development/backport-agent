@@ -4,14 +4,16 @@
  * Entry point for the Backport Agent CLI.
  *
  * **Initialization sequence:**
- *  1. Validate required environment variables (`KEYPOOL_VAULT_URL` or `KEYPOOL_LIVE_SECRET`).
- *  2. Load and validate `config.json` via `loadConfig()`.
- *  3. Load and validate `customizations.yaml` via `loadCustomizations()`.
- *  4. Assemble all agent tools from the individual factory functions.
- *  5. Instantiate the `Agent` with the keypoollive provider, system prompt, and tools.
- *  6. Subscribe to runtime events to stream assistant output to stdout.
- *  7. Call `agent.run(task)` with the sync task description.
- *  8. Print the final report (or exit with code 1 on any fatal error).
+ *  1. Parse CLI arguments (`--verbose`, `--config`, `--backport-customizations`,
+ *     `--keypool-vault-url`, `--keypool-live-secret`, `--keypool-state-file`, `--dry-run`).
+ *  2. Validate required environment variables (`KEYPOOL_VAULT_URL` or `KEYPOOL_LIVE_SECRET`).
+ *  3. Load and validate `config.json` via `loadConfig()`.
+ *  4. Load and validate `customizations.yaml` via `loadCustomizations()`.
+ *  5. Assemble all agent tools from the individual factory functions.
+ *  6. Instantiate the `Agent` with the keypoollive provider, system prompt, and tools.
+ *  7. Subscribe to runtime events to stream assistant output to stdout.
+ *  8. Call `agent.run(task)` with the sync task description.
+ *  9. Print the final report (or exit with code 1 on any fatal error).
  *
  * **Provider:**
  * `keypoollive` with `apiKey: "auto"` uses the `KEYPOOL_VAULT_URL` environment
@@ -19,6 +21,32 @@
  * automatic key rotation without storing secrets in the codebase.
  */
 /// <reference types="node" />
+// ---------------------------------------------------------------------------
+// CLI argument parsing — runs before .env loading so flags can override env.
+// ---------------------------------------------------------------------------
+{
+  const argv = process.argv.slice(2)
+  function getArgValue(name: string): string | undefined {
+    const idx = argv.indexOf(name)
+    return idx !== -1 && idx + 1 < argv.length ? argv[idx + 1] : undefined
+  }
+  function hasFlag(name: string): boolean {
+    return argv.includes(name)
+  }
+
+  if (hasFlag("--verbose")) process.env.VERBOSE = "true"
+  if (hasFlag("--dry-run")) process.env.DRY_RUN = "true"
+  const cliConfig = getArgValue("--config")
+  if (cliConfig) process.env._CLI_CONFIG_PATH = cliConfig
+  const cliCustomizations = getArgValue("--backport-customizations")
+  if (cliCustomizations) process.env.BACKPORT_CUSTOMIZATIONS = cliCustomizations
+  const cliVaultUrl = getArgValue("--keypool-vault-url")
+  if (cliVaultUrl) process.env.KEYPOOL_VAULT_URL = cliVaultUrl
+  const cliLiveSecret = getArgValue("--keypool-live-secret")
+  if (cliLiveSecret) process.env.KEYPOOL_LIVE_SECRET = cliLiveSecret
+  const cliStateFile = getArgValue("--keypool-state-file")
+  if (cliStateFile) process.env.KEYPOOL_STATE_FILE = cliStateFile
+}
 // Load .env file if present — allows setting KEYPOOL_VAULT_URL, KEYPOOL_LIVE_SECRET,
 // BACKPORT_CUSTOMIZATIONS, etc. without modifying the shell environment.
 // Uses Node.js 20.6+ built-in --env-file support via the `dotenv` fallback.
@@ -81,7 +109,11 @@ Produce a draft pull request with a clear report. Never push directly to the mai
    a. Call cherry_pick_commit.
    b. If success: record as "applied" in commitResults and proceed to next.
    c. If conflicts: for each conflicted file, call get_conflict_context, then attempt resolution.
-      - Call resolve_conflict_with_ai with the base/ours/theirs content to get an AI-proposed resolution.
+      - Check the \`forcedStrategy\` field returned by get_conflict_context:
+        * \`forcedStrategy: "ours"\`   → use \`forkVersion\` directly as resolvedContent; call apply_resolved_file immediately. No AI call needed.
+        * \`forcedStrategy: "theirs"\` → use \`upstreamVersion\` directly as resolvedContent; call apply_resolved_file immediately. No AI call needed.
+        * \`forcedStrategy: null\`     → proceed with AI resolution below.
+      - (When forcedStrategy is null) Call resolve_conflict_with_ai with the base/ours/theirs content to get an AI-proposed resolution.
       - If confidence is "high" or "medium": verify no conflict markers remain, then call apply_resolved_file, then continue_cherry_pick.
       - If confidence is "low" or the tool returned an error: call abort_cherry_pick, mark commit as conflict-blocked.
 6. Call run_validation with the highest risk level encountered in this run.
@@ -135,8 +167,11 @@ async function main() {
 
   // --- Config & customization loading ---
   // Both loaders throw descriptive errors if the files are missing or invalid.
-  const config = loadConfig()
-  const customizations = loadCustomizations()
+  const config = loadConfig(process.env._CLI_CONFIG_PATH)
+  // loadCustomizations supports: string path, URL, or inline object from config.
+  const customizations = await loadCustomizations(
+    config.customizations ?? process.env.BACKPORT_CUSTOMIZATIONS,
+  )
 
   // --- Authentication + working directory setup ---
   // applyGitAuth sets process-level env vars (GIT_SSH_COMMAND or GIT_CONFIG_*)
@@ -242,7 +277,18 @@ async function main() {
   // keep non-verbose runs clean.  Set VERBOSE=true in .env or the shell to enable.
   const verbose = process.env.VERBOSE === "true"
   let lastEventWasText = false
+  // Track the highest iteration seen so far across all attempts, so that when
+  // the agent is restarted after a provider error the displayed counter is
+  // continuous rather than resetting to 1.
+  let iterationOffset = 0
+  let lastSeenIteration = 0
+  let currentAttempt = 1
   agent.subscribe((event: Parameters<Parameters<typeof agent.subscribe>[0]>[0]) => {
+    const rawIter = (event as unknown as { iteration?: number }).iteration
+    if (typeof rawIter === "number" && rawIter > lastSeenIteration) {
+      lastSeenIteration = rawIter
+    }
+    const displayIter = typeof rawIter === "number" ? iterationOffset + rawIter : "?"
     if (event.type === "assistant-text-delta") {
       lastEventWasText = true
       process.stdout.write(event.text)
@@ -258,14 +304,14 @@ async function main() {
               .map((k) => `${k}=${JSON.stringify(inp[k]).slice(0, 60)}`)
               .join(", ")
           : "(no input)"
-      process.stderr.write(`[→ iter ${event.iteration}] ${event.toolCall.toolName}(${preview})\n`)
+      process.stderr.write(`[→ iter ${displayIter}] ${event.toolCall.toolName}(${preview})\n`)
     } else if (event.type === "tool-finished" && verbose) {
       lastEventWasText = false
       const result = event.toolCall as unknown as { toolName: string }
-      process.stderr.write(`[← iter ${event.iteration}] ${result.toolName ?? event.toolCall.toolName} done\n`)
+      process.stderr.write(`[← iter ${displayIter}] ${result.toolName ?? event.toolCall.toolName} done\n`)
     } else if ((event.type === "iteration_start" || event.type === "turn-started") && verbose) {
-      const iter = (event as unknown as { iteration?: number }).iteration ?? "?"
-      process.stderr.write(`\n--- iteration ${iter} ---\n`)
+      const retrySuffix = currentAttempt > 1 ? ` - Retry ${currentAttempt - 1}` : ""
+      process.stderr.write(`\n--- iteration ${displayIter}${retrySuffix} ---\n`)
     }
   })
 
@@ -286,12 +332,13 @@ async function main() {
   // this wrapper catches those and retries with exponential backoff.
   // Because agent state is persisted on disk (git), restarting the run is safe —
   // the agent will detect already-applied commits from the git log.
-  const RETRIABLE_RE = /503|rate.?limit|too many requests|overloaded|service.?unavailable/i
+  const RETRIABLE_RE = /503|rate.?limit|too many requests|overloaded|service.?unavailable|high.?demand|try again later|temporarily unavailable|exceeded your current quota|quota.*exceeded|check your plan|billing details/i
   const BASE_DELAY_MS = 15_000
   const MAX_ATTEMPTS = 5
 
   async function runWithRetry(): Promise<Awaited<ReturnType<typeof agent.run>>> {
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      currentAttempt = attempt
       let result: Awaited<ReturnType<typeof agent.run>>
       try {
         result = await agent.run(task)
@@ -303,6 +350,8 @@ async function main() {
             `[Retry] Provider error on attempt ${attempt}/${MAX_ATTEMPTS}: ${msg.slice(0, 120)}\n` +
               `[Retry] Waiting ${delay / 1000}s before retrying...\n`,
           )
+          iterationOffset += lastSeenIteration
+          lastSeenIteration = 0
           await new Promise((r) => setTimeout(r, delay))
           continue
         }
@@ -321,6 +370,8 @@ async function main() {
             `[Retry] Silent provider error (status=${result.status}) on attempt ${attempt}/${MAX_ATTEMPTS}: ${msg.slice(0, 120)}\n` +
               `[Retry] Waiting ${delay / 1000}s before retrying...\n`,
           )
+          iterationOffset += lastSeenIteration
+          lastSeenIteration = 0
           await new Promise((r) => setTimeout(r, delay))
           continue
         }

@@ -29,7 +29,19 @@
   },
   "models": {
     "fast": "mistral/devstral-latest",
+    "specialist": "mistral/devstral-latest",
     "powerful": "mistral/magistral-medium-latest"
+  },
+  "resolve": {
+    "_comment": "Glob or /regex/flags patterns matched against repo-relative file paths",
+    "ours": [
+      "package-lock.json",
+      "bun.lockb"
+    ],
+    "theirs": [
+      "CHANGELOG.md",
+      "/^docs\//"
+    ]
   },
   "report": {
     "destination": "."

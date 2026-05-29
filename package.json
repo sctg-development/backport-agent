@@ -6,29 +6,43 @@
   "engines": {
     "node": ">=22"
   },
+  "bin": {
+    "backport-agent": "./dist/main.mjs"
+  },
+  "files": [
+    "dist/",
+    "README.md",
+    "LICENSE.md",
+    "config.example.json",
+    "customizations.example.yaml"
+  ],
   "scripts": {
     "start": "tsx src/main.ts",
     "dry-run": "DRY_RUN=true tsx src/main.ts",
     "dry-run:tea": "DRY_RUN=true BACKPORT_CUSTOMIZATIONS=/Users/rlemeill/Development/tea-ching-cline/.backport-agent/customizations.yaml tsx src/main.ts",
     "typecheck": "tsc --noEmit",
-    "build": "tsc --outDir dist",
+    "build": "vite build",
     "test": "npm run test:unit && npm run test:integration",
     "test:unit": "vitest run test/unit",
     "test:integration": "vitest run test/integration"
   },
   "dependencies": {
-    "@octokit/rest": "^21.0.2",
-    "@sctg/cline-sdk": "3.85.0-beta.20260526150719",
+    "@octokit/rest": "^22.0.1",
+    "@sctg/cline-sdk": "3.86.0-beta.20260529121901",
+    "dotenv": "^17.4.2",
     "js-yaml": "^4.1.0",
     "minimatch": "^10.0.1",
     "zod": "^4.4.3"
   },
   "devDependencies": {
     "@types/js-yaml": "^4.0.9",
-    "@types/node": "^22.0.0",
-    "dotenv": "^17.4.2",
+    "@types/node": "^22.19.19",
     "tsx": "^4.19.0",
     "typescript": "^6.0.3",
+    "vite": "^8.0.14",
     "vitest": "^4.1.7"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }

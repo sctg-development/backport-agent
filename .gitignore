@@ -1,3 +1,9 @@
 .ai/
 .env
 node_modules/
+analysis.md
+customizations.yaml
+keypool-state.json
+config.json
+run-*.prompts.jsonl
+dist/

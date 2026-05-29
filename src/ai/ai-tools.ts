@@ -291,33 +291,48 @@ export function makeAiTools(config: SyncConfig, logPath: string) {
         `\n--- THEIRS (upstream version) ---\n${theirContent}\n` +
         `\nOutput the JSON object now.`
 
-      try {
-        const subAgent = makeSubAgent(config.models.powerful, systemPrompt)
-        const t0 = Date.now()
-        const result = await subAgent.run(userPrompt)
-        const durationMs = Date.now() - t0
-        logPrompt(logPath, "resolve_conflict_with_ai", config.models.powerful, userPrompt, result.outputText ?? "", durationMs, null, result.usage)
-        const output = extractJson<{
-          resolvedContent: string
-          confidence: "high" | "medium" | "low"
-          reasoning: string
-        }>(result.outputText ?? "")
+      // Try specialist model first; fall back to powerful on any failure.
+      const modelsToTry = [
+        { modelId: config.models.specialist, label: "specialist" },
+        { modelId: config.models.powerful, label: "powerful" },
+      ]
 
-        return {
-          resolvedContent: output.resolvedContent,
-          confidence: output.confidence,
-          reasoning: output.reasoning,
-          error: null,
+      let lastError: string | null = null
+      for (const { modelId, label } of modelsToTry) {
+        try {
+          const subAgent = makeSubAgent(modelId, systemPrompt)
+          const t0 = Date.now()
+          const result = await subAgent.run(userPrompt)
+          const durationMs = Date.now() - t0
+          logPrompt(logPath, "resolve_conflict_with_ai", modelId, userPrompt, result.outputText ?? "", durationMs, null, result.usage)
+          const output = extractJson<{
+            resolvedContent: string
+            confidence: "high" | "medium" | "low"
+            reasoning: string
+          }>(result.outputText ?? "")
+
+          return {
+            resolvedContent: output.resolvedContent,
+            confidence: output.confidence,
+            reasoning: output.reasoning,
+            error: null,
+          }
+        } catch (err) {
+          lastError = err instanceof Error ? err.message : String(err)
+          process.stderr.write(
+            `[resolve_conflict_with_ai] ${label} model (${modelId}) failed: ${lastError.slice(0, 120)} — ${
+              label === "specialist" ? "retrying with powerful model" : "giving up"
+            }\n`,
+          )
+          logPrompt(logPath, "resolve_conflict_with_ai", modelId, userPrompt, "", 0, lastError)
         }
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err)
-        logPrompt(logPath, "resolve_conflict_with_ai", config.models.powerful, userPrompt, "", 0, message)
-        return {
-          resolvedContent: "",
-          confidence: "low" as const,
-          reasoning: `AI resolution failed: ${message}`,
-          error: message,
-        }
+      }
+
+      return {
+        resolvedContent: "",
+        confidence: "low" as const,
+        reasoning: `AI resolution failed on all models: ${lastError}`,
+        error: lastError,
       }
     },
   })

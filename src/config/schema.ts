@@ -10,6 +10,7 @@
  *  - `workingDir` – filesystem location of the local checkout
  *  - `auth`       – git authentication (SSH key or HTTP bearer token)
  *  - `sync`       – behavioural knobs (commit limits, dry-run mode, branch names…)
+ *  - `customizations` – inline or external customizations manifest (optional)
  *  - `models`     – LLM model identifiers used for cheap vs. powerful inference
  *  - `validation` – shell commands executed after cherry-picking, grouped by risk level
  */
@@ -175,16 +176,72 @@ export const SyncConfigSchema = z.object({
        */
       fast: z.string().default("mistral/devstral-latest").describe("Low-cost model for summaries and risk triage"),
       /**
+       * Model used as first attempt for conflict resolution — optimised for code tasks.
+       * Falls back to `models.powerful` if this call fails.
+       * Defaults to `"mistral/devstral-latest"`.
+       */
+      specialist: z
+        .string()
+        .default("mistral/devstral-latest")
+        .describe("Code-specialist model for conflict resolution (first attempt)"),
+      /**
        * Model used for complex conflict resolution that demands deeper reasoning.
+       * Invoked as a fallback when `models.specialist` fails.
        * Defaults to `"mistral/magistral-medium-latest"`.
        */
       powerful: z
         .string()
         .default("mistral/magistral-medium-latest")
-        .describe("High-capability model for conflict resolution"),
+        .describe("High-capability model for conflict resolution (fallback)"),
     })
     // Allow omitting the entire models block; individual fields carry defaults.
     .default(() => ({} as any)),
+
+  /**
+   * Deterministic merge-strategy overrides by file path.
+   *
+   * Each entry is either a glob pattern (matched via `minimatch`) or a regex
+   * literal in the form `/pattern/flags` (e.g. `"/^sdk\\/.*\.lock$/i"`).
+   * Patterns are tested against the repo-relative file path.
+   *
+   * When a conflicted file matches:
+   *  - `ours`   → the fork version (HEAD) is used as-is; AI resolution is skipped.
+   *  - `theirs` → the upstream version (CHERRY_PICK_HEAD) is used as-is; AI resolution is skipped.
+   *
+   * `theirs` is checked first; if a file matches both, `theirs` wins.
+   */
+  resolve: z
+    .object({
+      /**
+       * Patterns for files where the fork version must always be kept.
+       * Useful for lock files, generated assets, or files maintained exclusively in the fork.
+       */
+      ours: z.array(z.string()).default([]).describe("Glob/regex patterns — always keep fork version on conflict"),
+      /**
+       * Patterns for files where the upstream version must always be taken.
+       * Useful for changelogs, upstream-owned config files, or generated files
+       * that must not carry fork modifications.
+       */
+      theirs: z.array(z.string()).default([]).describe("Glob/regex patterns — always take upstream version on conflict"),
+    })
+    .default(() => ({} as any)),
+
+  /**
+   * Customizations manifest source.
+   *
+   * Accepts three forms:
+   *  - `string` starting with `http://` or `https://` → fetched at runtime.
+   *  - `string` (any other value) → treated as a local filesystem path.
+   *  - `object` → the manifest is embedded directly in config.json (JSON equivalent
+   *    of the YAML structure expected by `CustomizationsSchema`).
+   *
+   * When omitted the loader falls back to the `BACKPORT_CUSTOMIZATIONS` env var,
+   * then to `./customizations.yaml` in the current working directory.
+   */
+  customizations: z
+    .union([z.string(), z.record(z.string(), z.unknown())])
+    .optional()
+    .describe("Path, URL, or inline object for the customizations manifest"),
 
   /**
    * Report output settings.

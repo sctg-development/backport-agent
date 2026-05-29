@@ -75,6 +75,28 @@ If you want a no-op run that still exercises the workflow, use:
 npm run dry-run
 ```
 
+Set `VERBOSE=true` to see detailed iteration and tool-call progress in stderr:
+
+```bash
+VERBOSE=true npm start
+```
+
+## Retry behavior
+
+The agent includes automatic retry logic for transient provider errors (rate limits, overloaded endpoints, high-demand responses, HTTP 503, etc.). When a retriable error is detected, the agent waits with exponential backoff (15 s, 30 s, 45 s…) and restarts up to 5 times.
+
+Because agent state is anchored to Git, restarting is safe — already-applied commits are detected from the git log and skipped automatically.
+
+The iteration counter in verbose output is continuous across retries. A retry is indicated by a suffix in the progress lines:
+
+```
+--- iteration 16 ---
+[Retry] Silent provider error on attempt 1/5: This model is currently experiencing high demand…
+[Retry] Waiting 15s before retrying...
+--- iteration 17 - Retry 1 ---
+--- iteration 18 - Retry 1 ---
+```
+
 ## Validation and tests
 
 The repository includes both unit and integration coverage.

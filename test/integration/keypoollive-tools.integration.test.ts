@@ -1,3 +1,5 @@
+/// <reference types="node" />
+/// <reference types="vitest" />
 import "dotenv/config"
 import { afterEach, describe, expect, it } from "vitest"
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
@@ -7,6 +9,7 @@ import { Agent, createBuiltinTools, createDefaultExecutors } from "@sctg/cline-s
 
 const hasVaultEnv = Boolean(process.env.KEYPOOL_VAULT_URL && process.env.KEYPOOL_LIVE_SECRET)
 const MODEL_ID = "mistral/devstral-latest"
+const FAST_MODEL_ID = "mistral/codestral-latest"
 const integration = hasVaultEnv ? it : it.skip
 
 function createAgentWithTools(options: {
@@ -16,7 +19,6 @@ function createAgentWithTools(options: {
   enableBash?: boolean
 }) {
   const executors = createDefaultExecutors({
-    cwd: options.cwd,
   })
 
   return new Agent({
@@ -54,6 +56,110 @@ describe("keypoollive real tool integrations", () => {
       rmSync(dir, { recursive: true, force: true })
     }
   })
+
+  integration(
+    "regression: mistral/devstral tool-call survives second turn and completes",
+    { timeout: 180_000 },
+    async () => {
+      const dir = mkdtempSync(join(tmpdir(), "backport-mistral-devstral-regression-"))
+      tempDirs.push(dir)
+
+      const targetFile = join(dir, "probe.txt")
+      writeFileSync(targetFile, "hello from regression test\n", "utf-8")
+
+      const agent = new Agent({
+        providerId: "keypoollive",
+        modelId: MODEL_ID,
+        apiKey: "auto",
+        systemPrompt:
+          "You are a strict test runner. Always call the requested tool first, then answer exactly DONE.",
+        tools: createBuiltinTools({
+          cwd: dir,
+          enableReadFiles: true,
+          enableSearch: false,
+          enableBash: false,
+          enableWebFetch: false,
+          enableApplyPatch: false,
+          enableEditor: false,
+          enableSkills: false,
+          enableAskQuestion: false,
+          enableSubmitAndExit: false,
+          executors: createDefaultExecutors({}),
+        }),
+      })
+
+      const toolNames: string[] = []
+      agent.subscribe((event) => {
+        if (event.type === "tool-started") {
+          toolNames.push(event.toolCall.toolName)
+        }
+      })
+
+      const result = await agent.run(
+        [
+          `Use read_files on ${targetFile}.`,
+          "After reading the file, reply with exactly DONE.",
+        ].join("\n"),
+      )
+
+      expect(toolNames).toContain("read_files")
+      expect(result.status).toBe("completed")
+      expect(result.error).toBeFalsy()
+      expect((result.outputText ?? "").trim().toLowerCase()).toContain("done")
+    },
+  )
+
+  integration(
+    "regression: mistral/codestral tool-call survives second turn and completes",
+    { timeout: 180_000 },
+    async () => {
+      const dir = mkdtempSync(join(tmpdir(), "backport-mistral-codestral-regression-"))
+      tempDirs.push(dir)
+
+      const targetFile = join(dir, "probe.txt")
+      writeFileSync(targetFile, "hello from regression test\n", "utf-8")
+
+      const agent = new Agent({
+        providerId: "keypoollive",
+        modelId: FAST_MODEL_ID,
+        apiKey: "auto",
+        systemPrompt:
+          "You are a strict test runner. Always call the requested tool first, then answer exactly DONE.",
+        tools: createBuiltinTools({
+          cwd: dir,
+          enableReadFiles: true,
+          enableSearch: false,
+          enableBash: false,
+          enableWebFetch: false,
+          enableApplyPatch: false,
+          enableEditor: false,
+          enableSkills: false,
+          enableAskQuestion: false,
+          enableSubmitAndExit: false,
+          executors: createDefaultExecutors({}),
+        }),
+      })
+
+      const toolNames: string[] = []
+      agent.subscribe((event) => {
+        if (event.type === "tool-started") {
+          toolNames.push(event.toolCall.toolName)
+        }
+      })
+
+      const result = await agent.run(
+        [
+          `Use read_files on ${targetFile}.`,
+          "After reading the file, reply with exactly DONE.",
+        ].join("\n"),
+      )
+
+      expect(toolNames).toContain("read_files")
+      expect(result.status).toBe("completed")
+      expect(result.error).toBeFalsy()
+      expect((result.outputText ?? "").trim().toLowerCase()).toContain("done")
+    },
+  )
 
   integration(
     "uses read_files and search_codebase through the real SDK tools",
@@ -138,7 +244,7 @@ describe("keypoollive real tool integrations", () => {
           enableSkills: false,
           enableAskQuestion: false,
           enableSubmitAndExit: false,
-          executors: createDefaultExecutors({ cwd }),
+          executors: createDefaultExecutors({}),
         }),
       })
 
@@ -187,7 +293,7 @@ describe("keypoollive real tool integrations", () => {
           enableSkills: false,
           enableAskQuestion: false,
           enableSubmitAndExit: false,
-          executors: createDefaultExecutors({ cwd: dir }),
+          executors: createDefaultExecutors({}),
         }),
       })
 
@@ -250,7 +356,7 @@ describe("keypoollive real tool integrations", () => {
           enableSkills: false,
           enableAskQuestion: false,
           enableSubmitAndExit: false,
-          executors: createDefaultExecutors({ cwd: dir }),
+          executors: createDefaultExecutors({}),
         }),
       })
 

@@ -15,7 +15,7 @@ describe("customizations loader", () => {
     }
   })
 
-  it("loads YAML customizations and flattens paths", () => {
+  it("loads YAML customizations and flattens paths", async () => {
     const dir = mkdtempSync(join(tmpdir(), "backport-customizations-"))
     tempDirs.push(dir)
 
@@ -41,7 +41,7 @@ describe("customizations loader", () => {
       "utf-8",
     )
 
-    const customizations = loadCustomizations(yamlPath)
+    const customizations = await loadCustomizations(yamlPath)
     const paths = getCustomizationPaths(customizations)
 
     expect(customizations.customizations).toHaveLength(2)
@@ -52,7 +52,7 @@ describe("customizations loader", () => {
     ])
   })
 
-  it("uses BACKPORT_CUSTOMIZATIONS when path is not provided", () => {
+  it("uses BACKPORT_CUSTOMIZATIONS when path is not provided", async () => {
     const dir = mkdtempSync(join(tmpdir(), "backport-customizations-env-"))
     tempDirs.push(dir)
 
@@ -73,7 +73,7 @@ describe("customizations loader", () => {
 
     process.env.BACKPORT_CUSTOMIZATIONS = yamlPath
 
-    const customizations = loadCustomizations()
+    const customizations = await loadCustomizations()
     expect(customizations.customizations[0].id).toBe("one")
   })
 })
