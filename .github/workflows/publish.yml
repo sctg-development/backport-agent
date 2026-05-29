@@ -42,4 +42,4 @@ jobs:
         run: npm version "${{ steps.version.outputs.version }}" --no-git-tag-version
 
       - name: Publish with provenance
-        run: npm publish --provenance --access public
+        run: npm publish --tag latest --access public
