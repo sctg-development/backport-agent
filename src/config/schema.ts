@@ -8,6 +8,7 @@
  *  - `upstream`   – coordinates of the original repository being tracked
  *  - `fork`       – coordinates of the customised fork maintained by this agent
  *  - `workingDir` – filesystem location of the local checkout
+ *  - `auth`       – git authentication (SSH key or HTTP bearer token)
  *  - `sync`       – behavioural knobs (commit limits, dry-run mode, branch names…)
  *  - `models`     – LLM model identifiers used for cheap vs. powerful inference
  *  - `validation` – shell commands executed after cherry-picking, grouped by risk level
@@ -36,6 +37,13 @@ export const SyncConfigSchema = z.object({
   upstream: z.object({
     /** GitHub repository in `owner/repo` format, e.g. `"cline/cline"`. */
     repo: z.string().describe("owner/repo of the upstream repository"),
+    /**
+     * Full git URL for the upstream remote, e.g. `"git@github.com:org/repo.git"` (SSH)
+     * or `"https://github.com/org/repo.git"` (HTTPS).
+     * Required when the working directory does not yet exist (for auto-clone setup).
+     * Supports any git hosting provider, not just GitHub.
+     */
+    url: z.string().optional().describe("Full git URL (SSH or HTTPS) for the upstream remote"),
     /** Branch on the upstream repo that the agent tracks, e.g. `"main"`. */
     branch: z.string().describe("Upstream branch to sync from"),
     /** Local git remote name pointing to the upstream repo. Defaults to `"upstream"`. */
@@ -49,6 +57,13 @@ export const SyncConfigSchema = z.object({
   fork: z.object({
     /** GitHub repository in `owner/repo` format, e.g. `"TEA-ching/cline"`. */
     repo: z.string().describe("owner/repo of the fork"),
+    /**
+     * Full git URL for cloning the fork, e.g. `"git@github.com:myuser/repo.git"` (SSH)
+     * or `"https://github.com/myuser/repo.git"` (HTTPS).
+     * If the working directory does not exist the agent will clone this URL automatically.
+     * Supports any git hosting provider, not just GitHub.
+     */
+    url: z.string().optional().describe("Full git URL (SSH or HTTPS) used to clone the fork"),
     /** Target branch in the fork that sync commits are based on, e.g. `"main"`. */
     branch: z.string().describe("Fork branch to sync into"),
     /** Local git remote name pointing to the fork. Defaults to `"origin"`. */
@@ -59,8 +74,43 @@ export const SyncConfigSchema = z.object({
    * Absolute filesystem path to the local git clone of the fork.
    * All git operations are executed with this path as the working directory.
    * Example: `"/home/ci/repos/my-fork"`.
+   * If the directory does not exist and `fork.url` is set, the agent will
+   * clone the fork automatically on startup.
    */
   workingDir: z.string().describe("Absolute path to the local clone of the fork"),
+
+  /**
+   * Git authentication credentials.
+   *
+   * Exactly one of `sshKeyPath` or `githubToken` should be set:
+   *  - `sshKeyPath`   — path to an SSH private key; sets `GIT_SSH_COMMAND` for all git calls.
+   *    Supports `~` expansion.  Example: `"~/.ssh/id_ed25519"`.
+   *  - `githubToken`  — bearer token for HTTPS remotes (GitHub PAT, GitLab token, etc.);
+   *    injected via `http.extraHeader`.  Works with any git hosting provider.
+   *    For security, prefer referencing an environment variable with the `$VAR` syntax
+   *    (e.g. `"$GITHUB_TOKEN"`) instead of embedding the raw token.  If omitted, the
+   *    agent falls back to the `GITHUB_TOKEN` environment variable automatically.
+   *
+   * Both fields are optional — omit this section if git is already authenticated
+   * through the system SSH agent or a credential helper.
+   */
+  auth: z
+    .object({
+      /**
+       * Absolute (or `~`-prefixed) path to the SSH private key.
+       * Example: `"~/.ssh/id_ed25519"` or `"/home/ci/.ssh/deploy_key"`.
+       */
+      sshKeyPath: z.string().optional().describe("Path to the SSH private key (supports ~ expansion)"),
+      /**
+       * Bearer token for HTTPS authentication.
+       * Prefix with `$` to read from an environment variable at runtime
+       * (e.g. `"$GITHUB_TOKEN"`), which avoids storing the secret in config.json.
+       */
+      githubToken: z.string().optional().describe(
+        "HTTP bearer token; use \"$ENV_VAR\" syntax to read from an environment variable"
+      ),
+    })
+    .default(() => ({} as any)),
 
   /**
    * Runtime behaviour settings for the sync loop.
@@ -68,6 +118,13 @@ export const SyncConfigSchema = z.object({
    */
   sync: z
     .object({
+      /**
+       * Maximum number of agent loop iterations per run.
+       * Each iteration is one model turn (potentially invoking several tools in parallel).
+       * Increase this value for large repos or runs with many conflict resolutions.
+       * Defaults to 200.
+       */
+      maxIterations: z.number().int().positive().default(200),
       /** Maximum number of upstream commits to process in a single agent run. Defaults to 20. */
       maxCommitsPerRun: z.number().int().positive().default(20),
       /**
