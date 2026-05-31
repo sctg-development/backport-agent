@@ -154,20 +154,27 @@ function logPrompt(
 }
 
 /**
- * Creates a minimal sub-`Agent` configured with the keypoollive provider.
+ * Creates a minimal sub-`Agent` for a single-turn AI reasoning call.
  *
  * The sub-agent has an empty tools array — it performs a single reasoning turn
  * and returns its text output via `result.outputText`.
  *
- * @param modelId     - Model identifier to use (fast or powerful).
+ * @param modelId      - Model identifier to use (fast or powerful).
  * @param systemPrompt - System prompt that scopes the sub-agent's behaviour.
+ * @param providerId   - LLM provider ID (e.g. `"anthropic"`, `"keypoollive"`).
+ * @param apiKey       - Resolved API key (or `undefined` to let the SDK discover it).
  * @returns A configured `Agent` instance ready to call `.run(userPrompt)`.
  */
-function makeSubAgent(modelId: string, systemPrompt: string): Agent {
+function makeSubAgent(
+  modelId: string,
+  systemPrompt: string,
+  providerId: string,
+  apiKey: string | undefined,
+): Agent {
   return new Agent({
-    providerId: "keypoollive",
+    providerId,
     modelId,
-    apiKey: "auto",
+    apiKey,
     systemPrompt,
     tools: [],
   })
@@ -180,12 +187,14 @@ function makeSubAgent(modelId: string, systemPrompt: string): Agent {
 /**
  * Builds and returns all AI-powered agent tools pre-bound to the provided config.
  *
- * @param config  - Validated `SyncConfig` loaded from `config.json`.
- * @param logPath - Absolute path to the JSONL prompt log file for this run.
- *                  Created by `main.ts` as `run-<timestamp>.prompts.jsonl`.
+ * @param config      - Validated `SyncConfig` loaded from `config.json`.
+ * @param logPath     - Absolute path to the JSONL prompt log file for this run.
+ *                      Created by `main.ts` as `run-<timestamp>.prompts.jsonl`.
+ * @param providerId  - LLM provider ID resolved from `config.models.provider`.
+ * @param apiKey      - Resolved API key (from config or env); `undefined` for SDK auto-discovery.
  * @returns Array of three agent tools for AI-assisted analysis.
  */
-export function makeAiTools(config: SyncConfig, logPath: string) {
+export function makeAiTools(config: SyncConfig, logPath: string, providerId: string, apiKey: string | undefined) {
   // -------------------------------------------------------------------------
   // Tool 1: resolve_conflict_with_ai
   // -------------------------------------------------------------------------
@@ -300,7 +309,7 @@ export function makeAiTools(config: SyncConfig, logPath: string) {
       let lastError: string | null = null
       for (const { modelId, label } of modelsToTry) {
         try {
-          const subAgent = makeSubAgent(modelId, systemPrompt)
+          const subAgent = makeSubAgent(modelId, systemPrompt, providerId, apiKey)
           const t0 = Date.now()
           const result = await subAgent.run(userPrompt)
           const durationMs = Date.now() - t0
@@ -415,7 +424,7 @@ export function makeAiTools(config: SyncConfig, logPath: string) {
         `Output the JSON object now.`
 
       try {
-        const subAgent = makeSubAgent(config.models.fast, systemPrompt)
+        const subAgent = makeSubAgent(config.models.fast, systemPrompt, providerId, apiKey)
         const t0 = Date.now()
         const result = await subAgent.run(userPrompt)
         const durationMs = Date.now() - t0
@@ -554,7 +563,7 @@ export function makeAiTools(config: SyncConfig, logPath: string) {
         `Output the JSON object now.`
 
       try {
-        const subAgent = makeSubAgent(config.models.fast, systemPrompt)
+        const subAgent = makeSubAgent(config.models.fast, systemPrompt, providerId, apiKey)
         const t0 = Date.now()
         const result = await subAgent.run(userPrompt)
         const durationMs = Date.now() - t0

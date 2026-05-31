@@ -50,43 +50,53 @@ export type CommitRisk = {
 /**
  * Glob patterns whose matches unconditionally elevate risk to `"high"`.
  *
- * These files are considered build-critical or structurally sensitive:
- *  - Dependency manifests and lockfiles (`package.json`, `*-lock.*`, `*.lock`)
- *  - CI / GitHub Actions workflows (`.github/workflows/**`)
- *  - Build scripts directory (`scripts/**`)
- *  - ESBuild config files (`esbuild.*`)
- *  - TypeScript project references (`tsconfig*.json`)
- *  - Protobuf definitions (`proto/**`) — changes here require proto regeneration
- *    and affect the entire RPC layer
+ * These patterns are intentionally generic so the classifier works for any
+ * repository layout (single-package, monorepo, multi-language, etc.).
+ *
+ *  - Root-level dependency manifests and lockfiles
+ *  - CI / GitHub Actions / GitLab / CircleCI pipelines
+ *  - Build scripts directory (scripts/**)
+ *  - TypeScript project references (tsconfig*.json)
+ *  - ESBuild config files (esbuild.*)
+ *  - Protobuf/schema definitions anywhere in the tree (glob: ** /proto/**)
+ *
+ * Fork-specific paths (e.g. custom source directories, generated assets) should
+ * be declared in `customizations.yaml` — the classifier always checks those first.
  */
 const HIGH_RISK_PATTERNS = [
+  // Root-level package manifests and lockfiles
   "package.json",
   "package-lock.json",
   "pnpm-lock.yaml",
   "yarn.lock",
+  "bun.lock",
+  "bun.lockb",
+  // CI / CD pipelines
   ".github/workflows/**",
+  ".gitlab-ci.yml",
+  ".circleci/**",
+  // Build tooling
   "scripts/**",
   "esbuild.*",
   "tsconfig*.json",
-  "proto/**",
+  // Schema/proto definitions (matches at any depth)
+  "**/proto/**",
 ]
 
 /**
  * Glob patterns whose matches elevate risk to `"medium"` when no high-risk
  * pattern has already been matched.
  *
- * These paths contain shared infrastructure that is more likely to conflict
- * with fork customizations than generic feature code:
- *  - `src/core/api/**`           — API provider implementations
- *  - `src/shared/**`             — Shared types and utilities used everywhere
- *  - `src/services/**`           — Backend services (MCP hub, etc.)
- *  - `webview-ui/src/services/**`— Webview service layer
+ * These generic patterns capture shared infrastructure that commonly conflicts
+ * with fork customizations across different project layouts (API layers,
+ * shared types, services, and provider registries at any depth).
  */
 const MEDIUM_RISK_PATTERNS = [
-  "src/core/api/**",
-  "src/shared/**",
-  "src/services/**",
-  "webview-ui/src/services/**",
+  "**/src/core/api/**",
+  "**/src/shared/**",
+  "**/src/services/**",
+  "**/src/providers/**",
+  "**/src/api/**",
 ]
 
 /**

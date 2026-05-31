@@ -9,7 +9,9 @@
  *  3. `config.json` in the current working directory.
  *
  * Environment variable overrides applied after parsing:
- *  - `DRY_RUN=true` → forces `sync.dryRun = true` regardless of the JSON value.
+ *  - `DRY_RUN=true`       → forces `sync.dryRun = true` regardless of the JSON value.
+ *  - `_CLI_PROVIDER=<id>` → overrides `models.provider` (set by `--provider` flag).
+ *  - `_CLI_API_KEY=<key>` → overrides `models.apiKey` (set by `--api-key` flag).
  */
 
 import { readFileSync } from "node:fs"
@@ -44,14 +46,22 @@ export function loadConfig(configPath?: string): SyncConfig {
 
   // Environment variable overrides — applied before Zod validation so that
   // field-level constraints (e.g. type checks) still apply to the final values.
-  if (process.env.KEYPOOL_VAULT_URL) {
-    // KEYPOOL_VAULT_URL is consumed by the keypoollive provider, not by this schema.
-    // We validate its presence separately in main.ts at agent startup.
-  }
+  // KEYPOOL_VAULT_URL / KEYPOOL_LIVE_SECRET are consumed directly by the
+  // keypoollive provider SDK — they are not stored in the schema.
 
   if (process.env.DRY_RUN === "true") {
     // Allow CI pipelines to safely test the agent without pushing anything.
     raw.sync = { ...(raw.sync ?? {}), dryRun: true }
+  }
+
+  // --provider CLI flag: overrides config.models.provider
+  if (process.env._CLI_PROVIDER) {
+    raw.models = { ...(raw.models ?? {}), provider: process.env._CLI_PROVIDER }
+  }
+
+  // --api-key CLI flag: overrides config.models.apiKey
+  if (process.env._CLI_API_KEY) {
+    raw.models = { ...(raw.models ?? {}), apiKey: process.env._CLI_API_KEY }
   }
 
   // Validate and apply defaults.  SyncConfigSchema.parse() throws on invalid input.

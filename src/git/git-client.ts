@@ -110,6 +110,19 @@ export function ensureMergeBase(
  *  - Lines prefixed with `+` are **not** in the fork → candidates for cherry-pick.
  *  - Lines prefixed with `-` **are** equivalent in the fork → already applied.
  *
+ * **Limitation of `git cherry`:** it compares patch IDs (a hash of the
+ * normalised diff).  When a cherry-pick was modified during conflict resolution
+ * the patch content changes, so the patch ID no longer matches and `git cherry`
+ * incorrectly marks the commit as `+` even though it was already integrated.
+ *
+ * To compensate, a secondary detection pass cross-references the fork's commit
+ * history on two additional signals:
+ *  1. **Subject match** – the fork contains a commit with the exact same
+ *     first-line subject as the upstream commit.
+ *  2. **SHA reference** – the fork contains a commit whose message body
+ *     includes a `cherry picked from commit <sha>` annotation (added
+ *     automatically by `git cherry-pick -x`).
+ *
  * @param cwd         - Absolute path to the repository working directory.
  * @param upstreamRef - Full ref for the upstream branch, e.g. `"upstream/main"`.
  * @param forkRef     - Full ref for the fork branch, e.g. `"origin/main"`.
@@ -120,14 +133,14 @@ export function listCandidateCommits(
   upstreamRef: string,
   forkRef: string,
 ): CandidateCommit[] {
-  // `git cherry -v <upstream> <fork>` lists commits reachable from <upstream>
+  // `git cherry -v <fork> <upstream>` lists commits reachable from <upstream>
   // but not equivalent in <fork>.  The `-v` flag adds the subject line.
   const cherryOutput = git(["cherry", "-v", forkRef, upstreamRef], cwd)
 
   // Empty output means upstream and fork are already in sync.
   if (!cherryOutput) return []
 
-  return cherryOutput.split("\n").map((line) => {
+  const rawCandidates = cherryOutput.split("\n").map((line) => {
     // Each line: `<marker> <sha> <subject>` where marker is `+` or `-`.
     const marker = line[0]
     const rest = line.slice(2) // skip marker and space
@@ -140,6 +153,56 @@ export function listCandidateCommits(
       // `-` means an equivalent patch already exists in the fork.
       alreadyApplied: marker === "-",
     }
+  })
+
+  // Fast path: if git cherry already marked every commit as applied, skip the
+  // secondary pass entirely.
+  if (rawCandidates.every((c) => c.alreadyApplied)) return rawCandidates
+
+  // Secondary detection pass — catches cherry-picks that were modified during
+  // conflict resolution (different patch content breaks git cherry's comparison).
+  // We scan the last FORK_LOG_DEPTH commits on the fork branch for two signals.
+  const FORK_LOG_DEPTH = 5000
+
+  // Signal 1: collect all first-line subjects from recent fork commits.
+  const forkSubjects = new Set<string>()
+  try {
+    const subjectLog = git(["log", forkRef, "--format=%s", `--max-count=${FORK_LOG_DEPTH}`], cwd)
+    for (const s of subjectLog.split("\n")) {
+      const trimmed = s.trim()
+      if (trimmed) forkSubjects.add(trimmed)
+    }
+  } catch {
+    // Fork branch may not exist locally yet; ignore and fall back to git cherry only.
+  }
+
+  // Signal 2: collect upstream SHA references embedded in fork commit message bodies.
+  // `git cherry-pick -x` appends "(cherry picked from commit <sha>)" automatically.
+  const forkShaRefs = new Set<string>()
+  try {
+    const bodyLog = git(["log", forkRef, "--format=%B", `--max-count=${FORK_LOG_DEPTH}`], cwd)
+    for (const m of bodyLog.matchAll(/cherry.picked from commit ([0-9a-f]{7,40})/gi)) {
+      forkShaRefs.add(m[1].toLowerCase())
+    }
+  } catch {
+    // Ignore — missing body log is non-fatal; subject matching still works.
+  }
+
+  return rawCandidates.map((c) => {
+    if (c.alreadyApplied) return c
+
+    // Signal 1: exact subject match.
+    if (forkSubjects.has(c.subject)) return { ...c, alreadyApplied: true }
+
+    // Signal 2: upstream SHA referenced inside a fork commit message.
+    const upSha = c.sha.toLowerCase()
+    for (const ref of forkShaRefs) {
+      if (upSha.startsWith(ref) || ref.startsWith(upSha.slice(0, 12))) {
+        return { ...c, alreadyApplied: true }
+      }
+    }
+
+    return c
   })
 }
 

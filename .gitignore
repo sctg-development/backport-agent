@@ -7,3 +7,4 @@ keypool-state.json
 config.json
 run-*.prompts.jsonl
 dist/
+.backport-agent/

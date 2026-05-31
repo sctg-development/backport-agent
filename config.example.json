@@ -28,6 +28,10 @@
     "branchPrefix": "sync/upstream-"
   },
   "models": {
+    "_comment_provider": "Any provider supported by @sctg/cline-sdk: \"keypoollive\", \"anthropic\", \"openai\", \"mistral\", \"gemini\", etc.",
+    "provider": "keypoollive",
+    "_comment_apiKey": "Use \"$ENV_VAR\" to read from env, \"auto\" for keypoollive vault, or omit to auto-detect {PROVIDER_UPPER}_API_KEY",
+    "apiKey": "auto",
     "fast": "mistral/devstral-latest",
     "specialist": "mistral/devstral-latest",
     "powerful": "mistral/magistral-medium-latest"

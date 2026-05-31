@@ -5,20 +5,25 @@
  *
  * **Initialization sequence:**
  *  1. Parse CLI arguments (`--verbose`, `--config`, `--backport-customizations`,
- *     `--keypool-vault-url`, `--keypool-live-secret`, `--keypool-state-file`, `--dry-run`).
- *  2. Validate required environment variables (`KEYPOOL_VAULT_URL` or `KEYPOOL_LIVE_SECRET`).
- *  3. Load and validate `config.json` via `loadConfig()`.
- *  4. Load and validate `customizations.yaml` via `loadCustomizations()`.
- *  5. Assemble all agent tools from the individual factory functions.
- *  6. Instantiate the `Agent` with the keypoollive provider, system prompt, and tools.
- *  7. Subscribe to runtime events to stream assistant output to stdout.
- *  8. Call `agent.run(task)` with the sync task description.
- *  9. Print the final report (or exit with code 1 on any fatal error).
+ *     `--provider`, `--api-key`, `--keypool-vault-url`, `--keypool-live-secret`,
+ *     `--keypool-state-file`, `--dry-run`).
+ *  2. Load and validate `config.json` via `loadConfig()` (CLI flags override JSON values).
+ *  3. Load and validate `customizations.yaml` via `loadCustomizations()`.
+ *  4. Assemble all agent tools from the individual factory functions.
+ *  5. Instantiate the `Agent` with the configured provider, system prompt, and tools.
+ *  6. Subscribe to runtime events to stream assistant output to stdout.
+ *  7. Call `agent.run(task)` with the sync task description.
+ *  8. Print the final report (or exit with code 1 on any fatal error).
  *
- * **Provider:**
- * `keypoollive` with `apiKey: "auto"` uses the `KEYPOOL_VAULT_URL` environment
- * variable to resolve API keys at runtime via an encrypted vault, enabling
- * automatic key rotation without storing secrets in the codebase.
+ * **Provider resolution:**
+ * The LLM provider is set by `config.models.provider` in `config.json` and can be
+ * overridden at runtime with `--provider`.  The API key is resolved in this order:
+ *  1. `--api-key <key>` CLI flag (or `_CLI_API_KEY` env var).
+ *  2. `config.models.apiKey` literal value or `"$ENV_VAR"` reference.
+ *  3. `{PROVIDER_UPPER}_API_KEY` environment variable (e.g. `ANTHROPIC_API_KEY`).
+ *  4. `undefined` — the SDK attempts its own credential discovery.
+ * The special value `"auto"` is accepted by the `keypoollive` provider to trigger
+ * vault-based key rotation via `KEYPOOL_VAULT_URL`.
  */
 /// <reference types="node" />
 // ---------------------------------------------------------------------------
@@ -45,16 +50,24 @@ Usage:
   backport-agent [options]
 
 Options:
-  --help, -h                     Show this help message
-  --config <path>                Path to config.json
+  --help, -h                            Show this help message
+  --config <path>                       Path to config.json
   --backport-customizations <path|url>  Override customizations source
-  --keypool-vault-url <url>      Override KEYPOOL_VAULT_URL
-  --keypool-live-secret <secret>  Override KEYPOOL_LIVE_SECRET
-  --keypool-state-file <path>    Override KEYPOOL_STATE_FILE
-  --dry-run                      Run without pushing changes
-  --verbose                      Enable verbose logs
+  --provider <id>                       Override config.models.provider
+                                        (e.g. anthropic, openai, mistral, gemini, keypoollive)
+  --api-key <key>                       Override config.models.apiKey
+                                        Use \$ENV_VAR syntax to read from an env variable
+  --list-backport-needed                Print pending upstream commits and exit (no agent run)
+  --dry-run                             Run without pushing changes
+  --verbose                             Enable verbose logs
+
+keypoollive provider options:
+  --keypool-vault-url <url>             Override KEYPOOL_VAULT_URL
+  --keypool-live-secret <secret>        Override KEYPOOL_LIVE_SECRET
+  --keypool-state-file <path>           Override KEYPOOL_STATE_FILE
 
 Note: config.json is only required for an actual run; this help text works without a config file.
+All --provider/--api-key flags take precedence over values in config.json.
 `)
   }
 
@@ -65,10 +78,16 @@ Note: config.json is only required for an actual run; this help text works witho
 
   if (hasFlag("--verbose")) process.env.VERBOSE = "true"
   if (hasFlag("--dry-run")) process.env.DRY_RUN = "true"
+  if (hasFlag("--list-backport-needed")) process.env._CLI_LIST_BACKPORT_NEEDED = "true"
   const cliConfig = getArgValue("--config")
   if (cliConfig) process.env._CLI_CONFIG_PATH = cliConfig
   const cliCustomizations = getArgValue("--backport-customizations")
   if (cliCustomizations) process.env.BACKPORT_CUSTOMIZATIONS = cliCustomizations
+  const cliProvider = getArgValue("--provider")
+  if (cliProvider) process.env._CLI_PROVIDER = cliProvider
+  const cliApiKey = getArgValue("--api-key")
+  if (cliApiKey) process.env._CLI_API_KEY = cliApiKey
+  // keypoollive-specific env var overrides
   const cliVaultUrl = getArgValue("--keypool-vault-url")
   if (cliVaultUrl) process.env.KEYPOOL_VAULT_URL = cliVaultUrl
   const cliLiveSecret = getArgValue("--keypool-live-secret")
@@ -79,15 +98,8 @@ Note: config.json is only required for an actual run; this help text works witho
 // Load .env file if present — allows setting KEYPOOL_VAULT_URL, KEYPOOL_LIVE_SECRET,
 // BACKPORT_CUSTOMIZATIONS, etc. without modifying the shell environment.
 // Uses Node.js 20.6+ built-in --env-file support via the `dotenv` fallback.
-import { existsSync } from "node:fs"
-import { resolve as resolvePath } from "node:path"
-{
-  const envPath = resolvePath(process.cwd(), ".env")
-  if (existsSync(envPath)) {
-    const { config } = await import("dotenv")
-    config({ path: envPath })
-  }
-}
+import { existsSync, mkdirSync } from "node:fs"
+import { resolve as resolvePath, join as joinPath } from "node:path"
 import { Agent, createBuiltinTools, createUserInstructionConfigService } from "@sctg/cline-sdk"
 import type { UserInstructionConfigRecord } from "@sctg/cline-sdk"
 import { loadConfig } from "./config/loader.js"
@@ -101,6 +113,40 @@ import { makeGitHubTools } from "./github/github-tools.js"
 import { makeReportTool } from "./reports/report-tools.js"
 import { buildNoopSyncReport } from "./reports/noop-report.js"
 import { makeAiTools } from "./ai/ai-tools.js"
+import type { SyncConfig } from "./config/schema.js"
+{
+  const envPath = resolvePath(process.cwd(), ".env")
+  if (existsSync(envPath)) {
+    const { config } = await import("dotenv")
+    config({ path: envPath })
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Provider config resolution
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolves the API key for the LLM provider from the agent config.
+ *
+ * Resolution order:
+ *  1. `_CLI_API_KEY` env var (set by the `--api-key` CLI flag).
+ *  2. `config.models.apiKey` literal value (no `$` prefix).
+ *  3. `config.models.apiKey` env-var reference: `"$ENV_VAR"` → `process.env[ENV_VAR]`.
+ *  4. Implicit convention: `{PROVIDER_UPPER}_API_KEY` env var
+ *     (e.g. `ANTHROPIC_API_KEY` for provider `"anthropic"`).
+ *  5. `undefined` — the SDK will attempt its own credential discovery.
+ */
+function resolveApiKey(config: SyncConfig): string | undefined {
+  // CLI flag takes highest priority
+  if (process.env._CLI_API_KEY) return process.env._CLI_API_KEY
+  const { provider, apiKey } = config.models
+  if (apiKey !== undefined) {
+    return apiKey.startsWith("$") ? process.env[apiKey.slice(1)] : apiKey
+  }
+  const envKey = `${provider.toUpperCase().replace(/-/g, "_")}_API_KEY`
+  return process.env[envKey]
+}
 
 // ---------------------------------------------------------------------------
 // System prompt — defines the agent's responsibilities and constraints.
@@ -168,7 +214,6 @@ Produce a draft pull request with a clear report. Never push directly to the mai
 - NEVER fabricate file content — only use content from get_conflict_context.
 - NEVER run commands that are not available as tools.
 - NEVER skip generate_report — it ends the run and produces the output.
-- If KEYPOOL_VAULT_URL is not set and apiKey is "auto", the run will fail before reaching this point.
 `
 
 // ---------------------------------------------------------------------------
@@ -184,25 +229,8 @@ Produce a draft pull request with a clear report. Never push directly to the mai
  * @throws On missing environment variables, invalid config, or agent failure.
  */
 async function main() {
-  // --- Environment validation ---
-  // Fail fast if the provider cannot authenticate: avoids a confusing runtime
-  // error deep inside the agent run.
-  if (!process.env.KEYPOOL_VAULT_URL && !process.env.KEYPOOL_LIVE_SECRET) {
-    console.error(
-      "Error: KEYPOOL_VAULT_URL environment variable is required for the keypoollive provider.\n" +
-        "Set it to your encrypted vault URL (e.g. https://raw.githubusercontent.com/.../ai.json.XXXX.enc)\n" +
-        "along with KEYPOOL_LIVE_SECRET as the decryption key.",
-    )
-    process.exit(1)
-  }
-
-  // --- Config & customization loading ---
-  // Both loaders throw descriptive errors if the files are missing or invalid.
+  // --- Config loading ---
   const config = loadConfig(process.env._CLI_CONFIG_PATH)
-  // loadCustomizations supports: string path, URL, or inline object from config.
-  const customizations = await loadCustomizations(
-    config.customizations ?? process.env.BACKPORT_CUSTOMIZATIONS,
-  )
 
   // --- Authentication + working directory setup ---
   // applyGitAuth sets process-level env vars (GIT_SSH_COMMAND or GIT_CONFIG_*)
@@ -218,7 +246,29 @@ async function main() {
   fetchRemotes(config.workingDir, config.upstream.remote, config.fork.remote, config.sync.initialFetchDepth)
   ensureMergeBase(config.workingDir, upstreamRef, forkRef, config.sync.maxFetchDepth)
 
-  const pendingCommits = listCandidateCommits(config.workingDir, upstreamRef, forkRef)
+  const allCandidates = listCandidateCommits(config.workingDir, upstreamRef, forkRef)
+
+  // --- --list-backport-needed: print pending commits and exit without running the agent ---
+  if (process.env._CLI_LIST_BACKPORT_NEEDED === "true") {
+    const pending = allCandidates.filter((c) => !c.alreadyApplied)
+    if (pending.length === 0) {
+      console.log("No upstream commits pending.")
+    } else {
+      console.log(`${pending.length} commit(s) pending backport from ${upstreamRef} into ${forkRef} (oldest first):\n`)
+      for (const c of pending) {
+        console.log(`${c.sha}  ${c.subject}`)
+      }
+    }
+    return
+  }
+
+  // --- Customization loading (deferred — not needed for --list-backport-needed) ---
+  // loadCustomizations supports: string path, URL, or inline object from config.
+  const customizations = await loadCustomizations(
+    config.customizations ?? process.env.BACKPORT_CUSTOMIZATIONS,
+  )
+
+  const pendingCommits = allCandidates
     .filter((candidate) => !candidate.alreadyApplied)
     .slice(0, config.sync.maxCommitsPerRun)
 
@@ -244,11 +294,15 @@ async function main() {
   const validationTool = makeValidationTool(config)     // 1 tool for validation suite
   const githubTools = makeGitHubTools(config)           // 3 tools for GitHub PR management
   // Prompt log file for this run — every sub-agent LLM call is appended here.
-  const promptLogPath = resolvePath(`run-${Date.now()}.prompts.jsonl`)
+  // Written alongside run reports inside config.report.destination.
+  const reportDir = resolvePath(config.workingDir, config.report.destination)
+  mkdirSync(reportDir, { recursive: true })
+  const promptLogPath = joinPath(reportDir, `run-${Date.now()}.prompts.jsonl`)
   process.stderr.write(`[PromptLogger] Writing sub-agent logs to: ${promptLogPath}\n`)
 
   const reportTool = makeReportTool(config, promptLogPath) // 1 terminal tool (completesRun: true)
-  const aiTools = makeAiTools(config, promptLogPath)       // 3 AI-powered analysis tools
+  const resolvedApiKey = resolveApiKey(config)
+  const aiTools = makeAiTools(config, promptLogPath, config.models.provider, resolvedApiKey) // 3 AI-powered analysis tools
 
   // --- SDK built-in tools ---
   // Add Cline integrated tools so the agent can also perform generic workspace
@@ -307,13 +361,13 @@ async function main() {
   const allTools = [...builtinTools, ...gitTools, riskTool, validationTool, ...githubTools, reportTool, ...aiTools]
 
   // --- Agent instantiation ---
-  // Using the keypoollive provider with "auto" apiKey — the SDK resolves the
-  // actual API key at runtime via KEYPOOL_VAULT_URL.
-  // config.models.fast selects the model configured for speed (see config.json).
+  // Provider and API key are read from config.models (provider + apiKey fields).
+  // The apiKey is resolved from a literal value, a "$ENV_VAR" reference, or the
+  // implicit convention "{PROVIDER_UPPER}_API_KEY" from the process environment.
   const agent = new Agent({
-    providerId: "keypoollive",
+    providerId: config.models.provider,
     modelId: config.models.fast,
-    apiKey: "auto", // SDK resolves via KEYPOOL_VAULT_URL at invocation time
+    apiKey: resolvedApiKey,
     systemPrompt: SYSTEM_PROMPT,
     tools: allTools,
     maxIterations: config.sync.maxIterations,

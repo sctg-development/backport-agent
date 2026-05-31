@@ -20,13 +20,11 @@ Backport Agent focuses on the parts that matter most:
 
 The agent works as a sync pipeline rather than a one-shot merge bot. It reads the upstream history, selects candidate commits, evaluates their risk, applies them in controlled batches, validates the result, and generates a report for review.
 
-It is built to support a fork that includes features such as:
+It is built to support forks that include features such as:
 
-- the `keypoollive` provider;
-- encrypted vault-backed model and key discovery;
-- round-robin key rotation;
-- GitHub Actions build-time package renaming;
-- Mintlify documentation generation;
+- custom LLM providers (e.g. `keypoollive` with encrypted vault-backed key rotation);
+- build-time package renaming and CI workflow customizations;
+- documentation generation pipelines;
 - a local reporting and validation workflow.
 
 ## How it is structured
@@ -56,11 +54,26 @@ npm install
 - [config.example.json](config.example.json)
 - [customizations.example.yaml](customizations.example.yaml)
 
-3. Set the required vault environment variables in your shell or `.env` file.
+3. Set the required provider credentials in your shell or `.env` file.
+
+For the **keypoollive** provider (vault-based key rotation):
 
 ```bash
 KEYPOOL_VAULT_URL=https://...
 KEYPOOL_LIVE_SECRET=...
+```
+
+For any other provider supported by `@sctg/cline-sdk`, set the corresponding API key:
+
+```bash
+ANTHROPIC_API_KEY=sk-ant-...
+# or OPENAI_API_KEY=sk-..., MISTRAL_API_KEY=..., etc.
+```
+
+You can also override the provider or API key at runtime without editing `config.json`:
+
+```bash
+npm start -- --provider anthropic --api-key sk-ant-...
 ```
 
 4. Start the agent.
@@ -106,7 +119,7 @@ The repository includes both unit and integration coverage.
 - `npm run test:unit` runs fast deterministic tests.
 - `npm run test:integration` runs integration tests, including real KeypoolLive calls when your vault is configured.
 
-The integration suite is intentionally practical. It verifies Git behavior in temporary repositories and exercises real SDK tools against the `keypoollive` provider with the `mistral/devstral-latest` model when `.env` is available.
+The integration suite is intentionally practical. It verifies Git behavior in temporary repositories and exercises real SDK tools against a configured provider (defaults to `keypoollive` with the `mistral/devstral-latest` model) when `.env` is available.
 
 ## Configuration
 
@@ -115,9 +128,11 @@ The main runtime configuration lives in a JSON file modeled after [config.exampl
 - the upstream repository and branch;
 - the fork repository and branch;
 - the working directory;
+- the LLM provider and model selection (`provider`, `fast`, `specialist`, `powerful`);
 - sync limits and batching;
-- model selection;
 - validation tiers.
+
+The `provider` field in the `models` section is required. It accepts any provider ID supported by `@sctg/cline-sdk` (e.g. `"keypoollive"`, `"anthropic"`, `"openai"`, `"mistral"`, `"gemini"`). The API key is resolved from the `apiKey` field, a `$ENV_VAR` reference, or the implicit `{PROVIDER_UPPER}_API_KEY` environment variable.
 
 Custom fork invariants live in a YAML file modeled after [customizations.example.yaml](customizations.example.yaml). This is where you describe the areas that must not be broken by a backport run.
 

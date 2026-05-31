@@ -163,12 +163,40 @@ export const SyncConfigSchema = z.object({
     .default(() => ({} as any)),
 
   /**
-   * LLM model identifiers for the keypoollive provider.
+   * LLM provider and model identifiers used by the agent.
    * Use a cheap/fast model for high-volume triage and a more powerful one for
    * conflict resolution where reasoning quality matters most.
+   *
+   * The `provider` field identifies which LLM provider to use (e.g. `"anthropic"`,
+   * `"openai"`, `"mistral"`, `"keypoollive"`).  If omitted, the agent falls back to
+   * looking up `{PROVIDER}_API_KEY` from the environment.
+   *
+   * The `apiKey` field accepts a literal value or an env-var reference
+   * using the `"$ENV_VAR_NAME"` syntax (e.g. `"$ANTHROPIC_API_KEY"`).
+   * If omitted, the agent automatically looks up `{PROVIDER_UPPER}_API_KEY` from
+   * the environment (e.g. `ANTHROPIC_API_KEY` for provider `"anthropic"`).
+   * The special value `"auto"` is accepted by the `keypoollive` provider to
+   * trigger vault-based key resolution at runtime.
    */
   models: z
     .object({
+      /**
+       * LLM provider ID to use for all agent calls.
+       * Examples: `"anthropic"`, `"openai"`, `"mistral"`, `"keypoollive"`.
+       * Required — no default is provided so that misconfigured runs fail fast.
+       */
+      provider: z.string().describe("LLM provider ID (e.g. \"anthropic\", \"openai\", \"keypoollive\")"),
+      /**
+       * API key for the provider.  Use `"$ENV_VAR_NAME"` to read from an env var
+       * at runtime (e.g. `"$ANTHROPIC_API_KEY"`).  Use `"auto"` for providers
+       * that resolve credentials internally (keypoollive vault).
+       * If omitted, the agent looks up `{PROVIDER_UPPER}_API_KEY` from the
+       * process environment automatically.
+       */
+      apiKey: z
+        .string()
+        .optional()
+        .describe("API key or \"$ENV_VAR\" reference; omit to auto-detect from environment"),
       /**
        * Model used for fast, inexpensive tasks such as summarising diffs and
        * classifying risk alongside the deterministic rule engine.
