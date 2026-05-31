@@ -36,6 +36,19 @@
     "specialist": "mistral/devstral-latest",
     "powerful": "mistral/magistral-medium-latest"
   },
+  "ai": {
+    "_comment": "AI quality guardrails — all fields are optional (defaults shown). Remove this section to use defaults.",
+    "minAutoApplyConfidence": "medium",
+    "_comment_minAutoApplyConfidence": "Minimum AI confidence level to auto-apply a conflict resolution without human review. \"high\" = only apply when the AI is very certain.",
+    "requireReviewOnSemanticRisk": false,
+    "_comment_requireReviewOnSemanticRisk": "When true, any commit with semantic risk factors (e.g. API surface changes) is escalated to \"review-required\" by reconcile_ai_assessments.",
+    "enableConflictConsensus": false,
+    "_comment_enableConflictConsensus": "DISABLED BY DEFAULT. Set to true to run a second independent resolution using config.models.powerful and compare the two outputs. Consensus failures downgrade confidence to \"low\". This roughly doubles LLM cost per conflict.",
+    "conflictConsensusThreshold": 0.7,
+    "_comment_conflictConsensusThreshold": "Minimum Dice-coefficient line similarity (0..1) between the two consensus responses to consider them in agreement. Only used when enableConflictConsensus=true.",
+    "enrichCustomizationContext": true,
+    "_comment_enrichCustomizationContext": "When true, check_customization_compatibility reads up to 2 matching source files (2000 chars each) and injects their content into the AI prompt for richer context."
+  },
   "resolve": {
     "_comment": "Glob or /regex/flags patterns matched against repo-relative file paths",
     "ours": [

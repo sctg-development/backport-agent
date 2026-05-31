@@ -61,7 +61,10 @@ export type CandidateCommit = {
  *
  * Algorithm:
  *  1. Try `git merge-base` at the current depth.
- *  2. If it fails, deepen by the next step value and retry.
+ *  2. If it fails, deepen to the next target depth by fetching only the *delta*
+ *     (`--deepen=<delta>`) so that each fetch step adds the minimum required
+ *     commits.  Tracking the delta avoids cumulative overfetching that would
+ *     occur when passing the absolute target depth directly to `--deepen`.
  *  3. If even `maxDepth` is insufficient, fall back to `--unshallow`.
  *
  * @param cwd         - Absolute path to the repository working directory.
@@ -78,24 +81,31 @@ export function ensureMergeBase(
   forkRef: string,
   maxDepth = 4000,
 ): string {
-  // Progressive depth ladder: try cheaper options first to minimise fetch size.
-  const depths = [200, 500, 1000, 2000, maxDepth]
+  // Progressive depth ladder: target depths to try in order.
+  // We track the previously-fetched depth and pass only the *increment* to
+  // --deepen so that each fetch adds exactly the commits needed rather than
+  // refetching already-present history.
+  const targetDepths = [200, 500, 1000, 2000, maxDepth]
+  let currentDepth = 0
 
-  for (const depth of depths) {
+  for (const targetDepth of targetDepths) {
     try {
       // Attempt to find the common ancestor at the current history depth.
       return git(["merge-base", upstreamRef, forkRef], cwd)
     } catch {
-      if (depth === maxDepth) {
+      if (targetDepth === maxDepth) {
         // Last resort: fetch the entire history and try once more.
         git(["fetch", "--unshallow"], cwd)
         return git(["merge-base", upstreamRef, forkRef], cwd)
       }
-      // Deepen the shallow clone by the next step and loop.
-      git(["fetch", `--deepen=${depth}`], cwd)
+      // Deepen by the delta to reach `targetDepth` without redundant refetching.
+      const delta = targetDepth - currentDepth
+      git(["fetch", `--deepen=${delta}`], cwd)
+      currentDepth = targetDepth
     }
   }
 
+  // Unreachable: the last iteration always returns or throws via --unshallow.
   throw new Error("Could not find merge-base even after full fetch")
 }
 
@@ -176,28 +186,30 @@ export function listCandidateCommits(
     // Fork branch may not exist locally yet; ignore and fall back to git cherry only.
   }
 
-  // Signal 2: collect upstream SHA references embedded in fork commit message bodies.
-  // `git cherry-pick -x` appends "(cherry picked from commit <sha>)" automatically.
-  const forkShaRefs = new Set<string>()
-  try {
-    const bodyLog = git(["log", forkRef, "--format=%B", `--max-count=${FORK_LOG_DEPTH}`], cwd)
-    for (const m of bodyLog.matchAll(/cherry.picked from commit ([0-9a-f]{7,40})/gi)) {
-      forkShaRefs.add(m[1].toLowerCase())
+// Signal 2: upstream SHA referenced inside a fork commit message body.
+    // `git cherry-pick -x` appends "(cherry picked from commit <sha>)" automatically.
+    const forkShaRefs = new Set<string>()
+    try {
+      const bodyLog = git(["log", forkRef, "--format=%B", `--max-count=${FORK_LOG_DEPTH}`], cwd)
+      for (const m of bodyLog.matchAll(/cherry.picked from commit ([0-9a-f]{7,40})/gi)) {
+        forkShaRefs.add(m[1].toLowerCase())
+      }
+    } catch {
+      // Ignore — missing body log is non-fatal; subject matching still works.
     }
-  } catch {
-    // Ignore — missing body log is non-fatal; subject matching still works.
-  }
 
-  return rawCandidates.map((c) => {
-    if (c.alreadyApplied) return c
+    return rawCandidates.map((c) => {
+      if (c.alreadyApplied) return c
 
-    // Signal 1: exact subject match.
-    if (forkSubjects.has(c.subject)) return { ...c, alreadyApplied: true }
+      // Signal 1: exact subject match.
+      if (forkSubjects.has(c.subject)) return { ...c, alreadyApplied: true }
 
-    // Signal 2: upstream SHA referenced inside a fork commit message.
-    const upSha = c.sha.toLowerCase()
-    for (const ref of forkShaRefs) {
-      if (upSha.startsWith(ref) || ref.startsWith(upSha.slice(0, 12))) {
+      // Signal 2: upstream SHA referenced inside a fork commit message.
+      // A fork commit references this upstream SHA when one is a prefix of the
+      // other (handles both abbreviated 7-char refs and full 40-char SHAs).
+      const upSha = c.sha.toLowerCase()
+      for (const ref of forkShaRefs) {
+        if (upSha.startsWith(ref) || ref.startsWith(upSha)) {
         return { ...c, alreadyApplied: true }
       }
     }
@@ -207,20 +219,45 @@ export function listCandidateCommits(
 }
 
 /**
- * Returns the list of file paths changed by a single commit.
+ * Returns the list of file paths changed by a single commit, with status prefixes
+ * for deletions and renames so that `classifyRisk` can detect them.
  *
- * Internally calls `git diff-tree --no-commit-id -r --name-only <sha>` which
- * lists only changed paths without any diff content, keeping the output small.
+ * Internally calls `git diff-tree --no-commit-id -r --name-status <sha>` which
+ * lists each changed path together with its status letter (M, A, D, R, C…).
+ *
+ * The returned strings follow the convention expected by `classifyRisk`:
+ *  - Regular changes (M, A, T, U, X…) → bare repo-relative path, e.g. `"src/foo.ts"`.
+ *  - Deletions (D)                     → `"DELETE:src/foo.ts"`.
+ *  - Renames / copies (R, C)           → `"RENAME:src/new.ts"` (new path used for
+ *    risk matching) *plus* the old path as a bare entry so both sides are checked.
  *
  * @param cwd - Absolute path to the repository working directory.
  * @param sha - Full or abbreviated commit SHA.
- * @returns Array of repository-relative file paths changed by the commit.
+ * @returns Array of repository-relative file paths changed by the commit,
+ *          with `DELETE:` / `RENAME:` prefixes where applicable.
  *          Empty array if the commit has no file changes (e.g. an empty commit).
  */
 export function getCommitChangedFiles(cwd: string, sha: string): string[] {
-  const output = git(["diff-tree", "--no-commit-id", "-r", "--name-only", sha], cwd)
-  // Filter out empty strings that result from splitting a trailing newline.
-  return output ? output.split("\n").filter(Boolean) : []
+  const output = git(["diff-tree", "--no-commit-id", "-r", "--name-status", sha], cwd)
+  if (!output) return []
+
+  const files: string[] = []
+  for (const line of output.split("\n").filter(Boolean)) {
+    // Format: `<status>\t<path>` for M/A/D, `<status><score>\t<oldPath>\t<newPath>` for R/C.
+    const parts = line.split("\t")
+    const statusCode = parts[0][0]  // First character is the status letter.
+    if (statusCode === "D") {
+      files.push(`DELETE:${parts[1]}`)
+    } else if (statusCode === "R" || statusCode === "C") {
+      // Include the old path so patterns on the source side are also matched,
+      // and the new path with a RENAME: prefix for risk classification.
+      files.push(parts[1])                  // old path (bare)
+      files.push(`RENAME:${parts[2]}`)      // new path with prefix
+    } else {
+      files.push(parts[1])
+    }
+  }
+  return files
 }
 
 /**

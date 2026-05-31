@@ -180,9 +180,13 @@ export function makeGitTools(config: SyncConfig) {
     execute: async () => {
       // Skip actual branch creation in dry-run mode.
       if (sync.dryRun) return { branchName: null, dryRun: true }
-      // Build the branch name from the configured prefix, upstream branch, and today's date.
-      const date = new Date().toISOString().slice(0, 10)
-      const branchName = `${sync.branchPrefix}${upstream.branch}-${date}`
+      // Build the branch name from the configured prefix, upstream branch, today's date,
+      // and the current UTC time (HHMM) to avoid collisions when the agent runs
+      // more than once in the same calendar day.
+      const now = new Date()
+      const date = now.toISOString().slice(0, 10)           // "YYYY-MM-DD"
+      const time = now.toISOString().slice(11, 16).replace(":", "")  // "HHMM"
+      const branchName = `${sync.branchPrefix}${upstream.branch}-${date}-${time}`
       createSyncBranch(workingDir, branchName, `${fork.remote}/${fork.branch}`)
       return { branchName }
     },

@@ -45,6 +45,45 @@ import { z } from "zod"
 import { Agent } from "@sctg/cline-sdk"
 import { defineTool } from "../tool-helper.js"
 import type { SyncConfig } from "../config/schema.js"
+import { globSync } from "node:fs"
+import { join as joinPath } from "node:path"
+import { minimatch } from "minimatch"
+
+// ---------------------------------------------------------------------------
+// Zod schemas for AI tool output validation (Improvement 1)
+// ---------------------------------------------------------------------------
+
+/**
+ * Expected shape of `resolve_conflict_with_ai` model output.
+ * Validated at runtime so schema mismatches surface immediately instead of
+ * silently propagating wrong types through the agent loop.
+ */
+const ConflictResolutionOutputSchema = z.object({
+  resolvedContent: z.string(),
+  confidence: z.enum(["high", "medium", "low"]),
+  reasoning: z.string(),
+})
+export { ConflictResolutionOutputSchema }
+
+/** Expected shape of `analyze_commit_for_backport` model output. */
+const AnalyzeCommitOutputSchema = z.object({
+  summary: z.string(),
+  keyChanges: z.array(z.string()),
+  backportComplexity: z.enum(["trivial", "moderate", "complex"]),
+  semanticRiskFactors: z.array(z.string()),
+  recommendation: z.enum(["apply", "apply-with-care", "review-required", "skip"]),
+})
+export { AnalyzeCommitOutputSchema }
+
+/** Expected shape of `check_customization_compatibility` model output. */
+const CheckCompatibilityOutputSchema = z.object({
+  compatible: z.boolean(),
+  affectedCustomizations: z.array(z.string()),
+  semanticConflicts: z.array(z.string()),
+  warnings: z.array(z.string()),
+  recommendation: z.string(),
+})
+export { CheckCompatibilityOutputSchema }
 
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -62,7 +101,7 @@ import type { SyncConfig } from "../config/schema.js"
  * @returns The parsed value cast to `T`.
  * @throws `SyntaxError` if no valid JSON can be found in the text.
  */
-function extractJson<T>(text: string): T {
+export function extractJson<T>(text: string): T {
   // 1. Try ```json … ``` code fence (most common for structured output)
   const jsonFenceMatch = text.match(/```json\s*([\s\S]*?)```/)
   if (jsonFenceMatch) {
@@ -89,7 +128,7 @@ function extractJson<T>(text: string): T {
 // PromptLogger — records all sub-agent LLM interactions to a JSONL file
 // ---------------------------------------------------------------------------
 
-import { appendFileSync } from "node:fs"
+import { appendFileSync, readFileSync } from "node:fs"
 
 /**
  * Token usage breakdown from a single sub-agent LLM call.
@@ -128,6 +167,7 @@ function logPrompt(
   durationMs: number,
   error?: string | null,
   usage?: TokenUsage | null,
+  extra?: Record<string, unknown>,
 ): void {
   const record = {
     timestamp: new Date().toISOString(),
@@ -144,6 +184,7 @@ function logPrompt(
       cacheWriteTokens: usage.cacheWriteTokens,
       ...(usage.totalCost != null ? { totalCost: usage.totalCost } : {}),
     } : {}),
+    ...(extra ?? {}),
   }
   try {
     appendFileSync(logPath, JSON.stringify(record) + "\n", "utf8")
@@ -151,6 +192,147 @@ function logPrompt(
     // Log write failures are non-fatal — the agent run must not be blocked.
     process.stderr.write(`[PromptLogger] Warning: could not write to ${logPath}\n`)
   }
+}
+
+// ---------------------------------------------------------------------------
+// Audit event logger — independent trail not relying on LLM self-reporting
+// (Improvement 9)
+// ---------------------------------------------------------------------------
+
+/**
+ * Appends a structured audit event to the run's JSONL log.
+ *
+ * Audit events are distinguished from prompt entries by the `"type": "audit_event"`
+ * field.  They are written unconditionally at the tool layer so the run audit
+ * trail cannot be silently omitted by the orchestrator LLM.
+ *
+ * @param logPath - JSONL log file path for the current run.
+ * @param tool    - Tool name that produced this event.
+ * @param event   - Short machine-readable event name (e.g. `"conflict_markers_detected"`).
+ * @param details - Optional structured key-value details.
+ */
+function logAuditEvent(
+  logPath: string,
+  tool: string,
+  event: string,
+  details?: Record<string, unknown>,
+): void {
+  const record = {
+    type: "audit_event" as const,
+    timestamp: new Date().toISOString(),
+    tool,
+    event,
+    ...(details ? { details } : {}),
+  }
+  try {
+    appendFileSync(logPath, JSON.stringify(record) + "\n", "utf8")
+  } catch {
+    process.stderr.write(`[AuditLog] Warning: could not write audit event to ${logPath}\n`)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Syntax balance checker for TypeScript / JavaScript files (Improvement 6)
+// ---------------------------------------------------------------------------
+
+const SYNTAX_CHECK_EXTENSIONS = new Set(["ts", "tsx", "js", "jsx", "mts", "cts", "mjs", "cjs"])
+
+/**
+ * Checks that braces, parentheses, and brackets are balanced in `content`.
+ * Only runs for TypeScript/JavaScript files (identified by `filePath` extension).
+ *
+ * Uses a simplified stripping pass (line comments, block comments, string literals)
+ * before counting delimiters.  Designed to catch the most common AI mistakes
+ * (truncated output, incomplete code blocks) rather than be a full parser.
+ *
+ * @returns `{ valid: true }` when balanced, or `{ valid: false, issue }` otherwise.
+ */
+export function checkSyntaxBalance(
+  content: string,
+  filePath: string,
+): { valid: boolean; issue?: string } {
+  const ext = filePath.split(".").pop()?.toLowerCase() ?? ""
+  if (!SYNTAX_CHECK_EXTENSIONS.has(ext)) return { valid: true }
+
+  // Strip line comments, block comments, and string/template literals.
+  // Template literals are stripped as opaque strings (simplified — does not
+  // handle nested template expressions, which is fine for this use-case).
+  const stripped = content
+    .replace(/\/\/[^\n]*/g, "")
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/"(?:[^"\\]|\\.)*"/g, '""')
+    .replace(/'(?:[^'\\]|\\.)*'/g, "''")
+    .replace(/`(?:[^`\\]|\\.)*`/g, "``")
+
+  let braces = 0, parens = 0, brackets = 0
+  for (const ch of stripped) {
+    if (ch === "{") braces++
+    else if (ch === "}") { if (--braces < 0) return { valid: false, issue: "Unexpected '}'" } }
+    else if (ch === "(") parens++
+    else if (ch === ")") { if (--parens < 0) return { valid: false, issue: "Unexpected ')'" } }
+    else if (ch === "[") brackets++
+    else if (ch === "]") { if (--brackets < 0) return { valid: false, issue: "Unexpected ']'" } }
+  }
+  if (braces !== 0) return { valid: false, issue: `Unbalanced braces (${braces > 0 ? "unclosed '{'" : "extra '}'"})` }
+  if (parens !== 0) return { valid: false, issue: `Unbalanced parentheses (${parens > 0 ? "unclosed '('" : "extra ')'"})` }
+  if (brackets !== 0) return { valid: false, issue: `Unbalanced brackets (${brackets > 0 ? "unclosed '['" : "extra ']'"})` }
+  return { valid: true }
+}
+
+// ---------------------------------------------------------------------------
+// Dice-coefficient line similarity — used for consensus comparison (Improvement 5)
+// ---------------------------------------------------------------------------
+
+/**
+ * Computes the Dice coefficient of two strings compared at the trimmed-line level.
+ *
+ * A score of `1.0` means both strings share identical non-empty line sets.
+ * A score of `0.0` means no lines in common.
+ *
+ * @returns Number in the range [0, 1].
+ */
+export function computeLineSimilarity(a: string, b: string): number {
+  const linesA = new Set(a.split("\n").map((l) => l.trim()).filter(Boolean))
+  const linesB = new Set(b.split("\n").map((l) => l.trim()).filter(Boolean))
+  const common = [...linesA].filter((l) => linesB.has(l)).length
+  const total = linesA.size + linesB.size
+  return total === 0 ? 1 : (2 * common) / total
+}
+
+// ---------------------------------------------------------------------------
+// Hallucination detector — cross-checks AI references against real files
+// (Improvement 8)
+// ---------------------------------------------------------------------------
+
+/**
+ * Scans free-text fragments for file-path-like references and returns those
+ * that do not appear in `actualChangedFiles`.
+ *
+ * Detected suspects are appended to `semanticRiskFactors` by
+ * `analyze_commit_for_backport` so the orchestrator and human reviewer are
+ * aware of potentially hallucinated claims.
+ *
+ * @param textFragments     - Free-text strings (keyChanges, semanticRiskFactors…).
+ * @param actualChangedFiles - Ground-truth list of files from `git diff-tree`.
+ * @returns Array of suspected hallucinated file references.
+ */
+export function detectHallucinatedFileRefs(
+  textFragments: string[],
+  actualChangedFiles: string[],
+): string[] {
+  const FILE_REF_RE =
+    /\b(?:[\w.-]+\/)+[\w.-]+\.(?:ts|tsx|js|jsx|mts|cts|mjs|cjs|json|md|yaml|yml|py|go|rs|java|kt|cs|cpp|c|h|rb|php|swift|sh)\b/g
+
+  const mentioned = new Set<string>()
+  for (const text of textFragments) {
+    for (const match of text.matchAll(FILE_REF_RE)) {
+      mentioned.add(match[0])
+    }
+  }
+
+  return [...mentioned].filter(
+    (ref) => !actualChangedFiles.some((cf) => cf === ref || cf.endsWith(`/${ref}`) || cf.includes(ref)),
+  )
 }
 
 /**
@@ -306,6 +488,9 @@ export function makeAiTools(config: SyncConfig, logPath: string, providerId: str
         { modelId: config.models.powerful, label: "powerful" },
       ]
 
+      // Regex for conflict markers — checked inside resolvedContent (Improvement 2).
+      const CONFLICT_MARKER_RE = /^(<{7}|={7}|>{7})/m
+
       let lastError: string | null = null
       for (const { modelId, label } of modelsToTry) {
         try {
@@ -313,17 +498,139 @@ export function makeAiTools(config: SyncConfig, logPath: string, providerId: str
           const t0 = Date.now()
           const result = await subAgent.run(userPrompt)
           const durationMs = Date.now() - t0
-          logPrompt(logPath, "resolve_conflict_with_ai", modelId, userPrompt, result.outputText ?? "", durationMs, null, result.usage)
-          const output = extractJson<{
-            resolvedContent: string
-            confidence: "high" | "medium" | "low"
-            reasoning: string
-          }>(result.outputText ?? "")
+
+          // --- Improvement 1: Zod schema validation ---
+          const rawOutput = extractJson<unknown>(result.outputText ?? "")
+          const validated = ConflictResolutionOutputSchema.safeParse(rawOutput)
+          if (!validated.success) {
+            const zodErr = validated.error.message
+            logPrompt(logPath, "resolve_conflict_with_ai", modelId, userPrompt, result.outputText ?? "", durationMs, `Schema validation failed: ${zodErr}`)
+            logAuditEvent(logPath, "resolve_conflict_with_ai", "schema_validation_failed", { modelId, label, error: zodErr })
+            lastError = `Schema validation failed: ${zodErr}`
+            process.stderr.write(
+              `[resolve_conflict_with_ai] ${label} model (${modelId}) returned invalid schema: ${zodErr.slice(0, 120)} — ${
+                label === "specialist" ? "retrying with powerful model" : "giving up"
+              }\n`,
+            )
+            continue
+          }
+          const output = validated.data
+
+          // --- Improvement 2: conflict marker guard ---
+          const hasConflictMarkers = CONFLICT_MARKER_RE.test(output.resolvedContent)
+
+          // --- Improvement 6: syntax balance check (TS/JS only) ---
+          const syntaxCheck = checkSyntaxBalance(output.resolvedContent, filePath)
+
+          // Effective confidence after guards.
+          let effectiveConfidence = output.confidence
+          const guards: string[] = []
+
+          if (hasConflictMarkers) {
+            effectiveConfidence = "low"
+            guards.push("conflict_markers_detected")
+            logAuditEvent(logPath, "resolve_conflict_with_ai", "conflict_markers_detected", { filePath, modelId })
+            process.stderr.write(
+              `[resolve_conflict_with_ai] GUARD: conflict markers in output for ${filePath} — downgrading confidence to low\n`,
+            )
+          }
+
+          if (!syntaxCheck.valid) {
+            effectiveConfidence = "low"
+            guards.push(`syntax_issue:${syntaxCheck.issue}`)
+            logAuditEvent(logPath, "resolve_conflict_with_ai", "syntax_validation_failed", {
+              filePath,
+              modelId,
+              issue: syntaxCheck.issue,
+            })
+            process.stderr.write(
+              `[resolve_conflict_with_ai] GUARD: syntax check failed for ${filePath}: ${syntaxCheck.issue} — downgrading confidence to low\n`,
+            )
+          }
+
+          // --- Improvement 5: self-consistency consensus (opt-in) ---
+          let consensusFailure = false
+          if (config.ai.enableConflictConsensus && label === "specialist" && !hasConflictMarkers) {
+            try {
+              const consensusAgent = makeSubAgent(config.models.powerful, systemPrompt, providerId, apiKey)
+              const ct0 = Date.now()
+              const consensusResult = await consensusAgent.run(userPrompt)
+              const consensusDurationMs = Date.now() - ct0
+              const consensusValidated = ConflictResolutionOutputSchema.safeParse(
+                extractJson<unknown>(consensusResult.outputText ?? ""),
+              )
+              if (consensusValidated.success) {
+                const similarity = computeLineSimilarity(
+                  output.resolvedContent,
+                  consensusValidated.data.resolvedContent,
+                )
+                logPrompt(
+                  logPath,
+                  "resolve_conflict_with_ai:consensus",
+                  config.models.powerful,
+                  userPrompt,
+                  consensusResult.outputText ?? "",
+                  consensusDurationMs,
+                  null,
+                  consensusResult.usage,
+                  { consensus: true, similarity },
+                )
+                if (similarity < config.ai.conflictConsensusThreshold) {
+                  effectiveConfidence = "low"
+                  consensusFailure = true
+                  guards.push(`consensus_divergence:${similarity.toFixed(2)}`)
+                  logAuditEvent(logPath, "resolve_conflict_with_ai", "consensus_divergence", {
+                    filePath,
+                    similarity,
+                    threshold: config.ai.conflictConsensusThreshold,
+                  })
+                  process.stderr.write(
+                    `[resolve_conflict_with_ai] CONSENSUS: models diverged (similarity=${similarity.toFixed(2)}, threshold=${config.ai.conflictConsensusThreshold}) for ${filePath} — downgrading to low\n`,
+                  )
+                } else {
+                  logAuditEvent(logPath, "resolve_conflict_with_ai", "consensus_passed", { filePath, similarity })
+                }
+              }
+            } catch (consensusErr) {
+              const msg = consensusErr instanceof Error ? consensusErr.message : String(consensusErr)
+              process.stderr.write(`[resolve_conflict_with_ai] Consensus check failed (non-fatal): ${msg}\n`)
+            }
+          }
+
+          const reasoning =
+            guards.length > 0 ? `[GUARD: ${guards.join(", ")}] ${output.reasoning}` : output.reasoning
+
+          logPrompt(
+            logPath,
+            "resolve_conflict_with_ai",
+            modelId,
+            userPrompt,
+            result.outputText ?? "",
+            durationMs,
+            null,
+            result.usage,
+            {
+              originalConfidence: output.confidence,
+              effectiveConfidence,
+              hasConflictMarkers,
+              syntaxValid: syntaxCheck.valid,
+              consensusFailure,
+              guards,
+            },
+          )
+          logAuditEvent(logPath, "resolve_conflict_with_ai", "resolution_complete", {
+            filePath,
+            modelId,
+            label,
+            originalConfidence: output.confidence,
+            effectiveConfidence,
+            guards,
+          })
 
           return {
             resolvedContent: output.resolvedContent,
-            confidence: output.confidence,
-            reasoning: output.reasoning,
+            confidence: effectiveConfidence,
+            reasoning,
             error: null,
           }
         } catch (err) {
@@ -337,6 +644,7 @@ export function makeAiTools(config: SyncConfig, logPath: string, providerId: str
         }
       }
 
+      logAuditEvent(logPath, "resolve_conflict_with_ai", "resolution_failed", { filePath, error: lastError })
       return {
         resolvedContent: "",
         confidence: "low" as const,
@@ -428,14 +736,53 @@ export function makeAiTools(config: SyncConfig, logPath: string, providerId: str
         const t0 = Date.now()
         const result = await subAgent.run(userPrompt)
         const durationMs = Date.now() - t0
-        logPrompt(logPath, "analyze_commit_for_backport", config.models.fast, userPrompt, result.outputText ?? "", durationMs, null, result.usage)
-        const output = extractJson<{
-          summary: string
-          keyChanges: string[]
-          backportComplexity: "trivial" | "moderate" | "complex"
-          semanticRiskFactors: string[]
-          recommendation: "apply" | "apply-with-care" | "review-required" | "skip"
-        }>(result.outputText ?? "")
+
+        // --- Improvement 1: Zod schema validation ---
+        const rawOutput = extractJson<unknown>(result.outputText ?? "")
+        const validated = AnalyzeCommitOutputSchema.safeParse(rawOutput)
+        if (!validated.success) {
+          throw new Error(`Schema validation failed: ${validated.error.message}`)
+        }
+        const output = validated.data
+
+        // --- Improvement 8: hallucination detection ---
+        const hallucinationSuspects = detectHallucinatedFileRefs(
+          [...output.keyChanges, ...output.semanticRiskFactors],
+          changedFiles,
+        )
+        if (hallucinationSuspects.length > 0) {
+          output.semanticRiskFactors.push(
+            `[AUDIT] ${hallucinationSuspects.length} possible hallucinated file reference(s) not found in diff: ${hallucinationSuspects.slice(0, 5).join(", ")}`,
+          )
+          logAuditEvent(logPath, "analyze_commit_for_backport", "hallucination_suspects", {
+            sha,
+            suspects: hallucinationSuspects,
+          })
+        }
+
+        logPrompt(
+          logPath,
+          "analyze_commit_for_backport",
+          config.models.fast,
+          userPrompt,
+          result.outputText ?? "",
+          durationMs,
+          null,
+          result.usage,
+          {
+            recommendation: output.recommendation,
+            backportComplexity: output.backportComplexity,
+            semanticRiskFactorsCount: output.semanticRiskFactors.length,
+            hallucinationSuspectsCount: hallucinationSuspects.length,
+          },
+        )
+        logAuditEvent(logPath, "analyze_commit_for_backport", "analysis_complete", {
+          sha,
+          recommendation: output.recommendation,
+          complexity: output.backportComplexity,
+          riskFactors: output.semanticRiskFactors.length,
+          hallucinationSuspects: hallucinationSuspects.length,
+        })
 
         return {
           summary: output.summary,
@@ -448,6 +795,7 @@ export function makeAiTools(config: SyncConfig, logPath: string, providerId: str
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err)
         logPrompt(logPath, "analyze_commit_for_backport", config.models.fast, userPrompt, "", 0, message)
+        logAuditEvent(logPath, "analyze_commit_for_backport", "analysis_failed", { sha, error: message })
         return {
           summary: `Analysis failed: ${message}`,
           keyChanges: [],
@@ -531,9 +879,34 @@ export function makeAiTools(config: SyncConfig, logPath: string, providerId: str
         }
       }
 
-      const customizationList = customizations
-        .map((c, i) => `  ${i + 1}. Pattern: ${c.pattern}\n     Description: ${c.description}`)
-        .join("\n")
+      // --- Improvement 4: enrich each customization with actual file content ---
+      const customizationList = (
+        await Promise.all(
+          customizations.map(async (c, i) => {
+            let contentSnippet = ""
+            if (config.ai.enrichCustomizationContext) {
+              try {
+                // globSync is available since Node.js v22 (required by engines field).
+                const matchedPaths = globSync(c.pattern, { cwd: config.workingDir })
+                  .filter(Boolean)
+                  .slice(0, 2)
+                const fileSnippets = matchedPaths
+                  .filter((f) => f !== "")
+                  .map((f) => {
+                    const content = readFileSync(joinPath(config.workingDir, f), "utf8").slice(0, 2000)
+                    return `[${f}]\n${content.split("\n").map((l) => "      " + l).join("\n")}`
+                  })
+                if (fileSnippets.length > 0) {
+                  contentSnippet = `\n     Current file content (${fileSnippets.length} file(s)):\n      ${fileSnippets.join("\n      ---\n")}`
+                }
+              } catch {
+                // Content enrichment is best-effort \u2014 never block a run.
+              }
+            }
+            return `  ${i + 1}. Pattern: ${c.pattern}\n     Description: ${c.description}${contentSnippet}`
+          }),
+        )
+      ).join("\n")
 
       const systemPrompt = [
         "You are an expert software engineer specialising in fork maintenance and semantic conflict detection.",
@@ -567,14 +940,37 @@ export function makeAiTools(config: SyncConfig, logPath: string, providerId: str
         const t0 = Date.now()
         const result = await subAgent.run(userPrompt)
         const durationMs = Date.now() - t0
-        logPrompt(logPath, "check_customization_compatibility", config.models.fast, userPrompt, result.outputText ?? "", durationMs, null, result.usage)
-        const output = extractJson<{
-          compatible: boolean
-          affectedCustomizations: string[]
-          semanticConflicts: string[]
-          warnings: string[]
-          recommendation: string
-        }>(result.outputText ?? "")
+
+        // --- Improvement 1: Zod schema validation ---
+        const rawOutput = extractJson<unknown>(result.outputText ?? "")
+        const validated = CheckCompatibilityOutputSchema.safeParse(rawOutput)
+        if (!validated.success) {
+          throw new Error(`Schema validation failed: ${validated.error.message}`)
+        }
+        const output = validated.data
+
+        logPrompt(
+          logPath,
+          "check_customization_compatibility",
+          config.models.fast,
+          userPrompt,
+          result.outputText ?? "",
+          durationMs,
+          null,
+          result.usage,
+          {
+            compatible: output.compatible,
+            affectedCount: output.affectedCustomizations.length,
+            semanticConflictsCount: output.semanticConflicts.length,
+            fileContentEnriched: config.ai.enrichCustomizationContext,
+          },
+        )
+        logAuditEvent(logPath, "check_customization_compatibility", "compatibility_check_complete", {
+          compatible: output.compatible,
+          affectedCustomizations: output.affectedCustomizations,
+          semanticConflictsCount: output.semanticConflicts.length,
+          fileContentEnriched: config.ai.enrichCustomizationContext,
+        })
 
         return {
           compatible: output.compatible,
@@ -587,6 +983,7 @@ export function makeAiTools(config: SyncConfig, logPath: string, providerId: str
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err)
         logPrompt(logPath, "check_customization_compatibility", config.models.fast, userPrompt, "", 0, message)
+        logAuditEvent(logPath, "check_customization_compatibility", "compatibility_check_failed", { error: message })
         return {
           compatible: false,
           affectedCustomizations: [],
@@ -599,6 +996,124 @@ export function makeAiTools(config: SyncConfig, logPath: string, providerId: str
     },
   })
 
-  // Return all three tools in a single array for spreading into the main Agent.
-  return [resolveConflictTool, analyzeCommitTool, checkCompatibilityTool]
+  // -------------------------------------------------------------------------
+  // Tool 4: reconcile_ai_assessments  (Improvements 3 + 10)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Tool: reconcile_ai_assessments
+   *
+   * Deterministic (no LLM) reconciliation of `analyze_commit_for_backport` and
+   * `check_customization_compatibility` outputs.
+   *
+   * Detects contradictions between the two AI assessments and always resolves
+   * ambiguity conservatively (more-restrictive recommendation wins).  When
+   * `config.ai.requireReviewOnSemanticRisk` is enabled, commits with semantic
+   * risk factors are escalated to "review-required" regardless of the individual
+   * AI recommendations.
+   *
+   * Calling this tool after both analysis tools have run produces a single,
+   * audited final recommendation the orchestrator can act on directly.
+   */
+  const reconcileAssessmentsTool = defineTool({
+    name: "reconcile_ai_assessments",
+    description:
+      "Reconciles potentially contradictory outputs from analyze_commit_for_backport and " +
+      "check_customization_compatibility into a single audited recommendation. " +
+      "Detects contradictions and always takes the more conservative path. " +
+      "No AI call is made \u2014 this is a fast deterministic step. " +
+      "Call this after both analyze_commit_for_backport and check_customization_compatibility " +
+      "have been invoked for the same commit.",
+    inputSchema: z.object({
+      /** Commit SHA being reconciled (for audit logging). */
+      sha: z.string().describe("Commit SHA being evaluated"),
+      /** `recommendation` from `analyze_commit_for_backport`. */
+      analyzeRecommendation: z
+        .enum(["apply", "apply-with-care", "review-required", "skip"])
+        .describe("Recommendation from analyze_commit_for_backport"),
+      /** `semanticRiskFactors` from `analyze_commit_for_backport`. */
+      analyzeSemanticRiskFactors: z
+        .array(z.string())
+        .describe("Semantic risk factors from analyze_commit_for_backport"),
+      /** `compatible` field from `check_customization_compatibility`. */
+      compatibilityCompatible: z
+        .boolean()
+        .describe("compatible field from check_customization_compatibility"),
+      /** `semanticConflicts` from `check_customization_compatibility`. */
+      compatibilitySemanticConflicts: z
+        .array(z.string())
+        .describe("semanticConflicts array from check_customization_compatibility"),
+      /** `recommendation` from `check_customization_compatibility`. */
+      compatibilityRecommendation: z
+        .string()
+        .describe("recommendation field from check_customization_compatibility"),
+    }),
+    execute: async ({
+      sha,
+      analyzeRecommendation,
+      analyzeSemanticRiskFactors,
+      compatibilityCompatible,
+      compatibilitySemanticConflicts,
+      compatibilityRecommendation,
+    }) => {
+      // Severity scale: lower = more permissive.
+      const SEVERITY: Record<string, number> = {
+        apply: 0,
+        "apply-with-care": 1,
+        "review-required": 2,
+        skip: 3,
+      }
+      const TO_REC = ["apply", "apply-with-care", "review-required", "skip"] as const
+
+      const analyzeSev = SEVERITY[analyzeRecommendation] ?? 2
+      // If check_compatibility says not compatible, treat as at-least "review-required".
+      const compatSev = compatibilityCompatible ? 0 : 2
+      let finalSev = Math.max(analyzeSev, compatSev)
+
+      // Apply config.ai.requireReviewOnSemanticRisk (Improvement 10).
+      if (config.ai.requireReviewOnSemanticRisk && analyzeSemanticRiskFactors.length > 0) {
+        finalSev = Math.max(finalSev, 2) // at least "review-required"
+      }
+
+      const finalRecommendation = TO_REC[Math.min(finalSev, 3)] ?? "review-required"
+
+      // Contradiction: analyze said "apply"/"apply-with-care" but check_compatibility found issues.
+      const contradictionDetected = analyzeSev < 2 && !compatibilityCompatible
+
+      const reasons: string[] = []
+      if (contradictionDetected) {
+        reasons.push(
+          `Contradiction: analyze_commit recommended \u201c${analyzeRecommendation}\u201d ` +
+            `but check_customization_compatibility found compatibility issues`,
+        )
+      }
+      if (compatibilitySemanticConflicts.length > 0) {
+        reasons.push(`Semantic conflicts: ${compatibilitySemanticConflicts.slice(0, 3).join("; ")}`)
+      }
+      if (analyzeSemanticRiskFactors.length > 0) {
+        reasons.push(`Risk factors: ${analyzeSemanticRiskFactors.slice(0, 3).join("; ")}`)
+      }
+      if (config.ai.requireReviewOnSemanticRisk && analyzeSemanticRiskFactors.length > 0 && finalSev >= 2) {
+        reasons.push(`Escalated: requireReviewOnSemanticRisk=true with ${analyzeSemanticRiskFactors.length} risk factor(s)`)
+      }
+
+      logAuditEvent(logPath, "reconcile_ai_assessments", contradictionDetected ? "contradiction_detected" : "no_contradiction", {
+        sha,
+        analyzeRecommendation,
+        compatibilityCompatible,
+        finalRecommendation,
+        compatibilityRecommendation,
+      })
+
+      return {
+        finalRecommendation,
+        contradictionDetected,
+        unifiedReasoning:
+          reasons.join(" | ") || `Both AI tools agree: proceed with \u201c${finalRecommendation}\u201d`,
+      }
+    },
+  })
+
+  // Return all four tools in a single array for spreading into the main Agent.
+  return [resolveConflictTool, analyzeCommitTool, checkCompatibilityTool, reconcileAssessmentsTool]
 }

@@ -134,7 +134,56 @@ The main runtime configuration lives in a JSON file modeled after [config.exampl
 
 The `provider` field in the `models` section is required. It accepts any provider ID supported by `@sctg/cline-sdk` (e.g. `"keypoollive"`, `"anthropic"`, `"openai"`, `"mistral"`, `"gemini"`). The API key is resolved from the `apiKey` field, a `$ENV_VAR` reference, or the implicit `{PROVIDER_UPPER}_API_KEY` environment variable.
 
+### `ai` section — Quality guardrails (optional)
+
+The optional `ai` section configures the AI quality guardrails introduced to improve backport reliability. All fields have safe defaults and the section can be omitted entirely.
+
+```json
+"ai": {
+  "minAutoApplyConfidence": "medium",
+  "requireReviewOnSemanticRisk": false,
+  "enableConflictConsensus": false,
+  "conflictConsensusThreshold": 0.7,
+  "enrichCustomizationContext": true
+}
+```
+
+| Field | Default | Description |
+|---|---|---|
+| `minAutoApplyConfidence` | `"medium"` | Minimum AI confidence level (`"high"` or `"medium"`) to auto-apply a conflict resolution. Use `"high"` for stricter auto-apply. |
+| `requireReviewOnSemanticRisk` | `false` | When `true`, any commit carrying semantic risk factors is escalated to `"review-required"` by `reconcile_ai_assessments`, regardless of the individual AI recommendations. |
+| `enableConflictConsensus` | `false` | **Opt-in.** Runs a second, independent conflict resolution using `config.models.powerful` and compares both outputs with a Dice-coefficient similarity score. If the two resolutions diverge below `conflictConsensusThreshold`, confidence is downgraded to `"low"`. Enabling this roughly doubles LLM cost per conflict. |
+| `conflictConsensusThreshold` | `0.7` | Minimum line-level similarity (0–1) required for consensus. Only used when `enableConflictConsensus: true`. |
+| `enrichCustomizationContext` | `true` | When `true`, `check_customization_compatibility` reads up to 2 source files matching each customization glob (2 000 chars each) and injects their content into the AI prompt for richer analysis. |
+
+### AI sub-agent tools
+
+The `src/ai` module exposes four tools that the main agent invokes when deterministic logic is not enough.
+
+| Tool | Type | Purpose |
+|---|---|---|
+| `resolve_conflict_with_ai` | LLM call | Resolves merge conflicts in a single file using the configured `specialist` model. Returns `resolvedContent`, `confidence` (`"high"` / `"medium"` / `"low"`), and `reasoning`. Guards: conflict-marker detection, syntax balance check (JS/TS), optional dual-model consensus. |
+| `analyze_commit_for_backport` | LLM call | Analyzes a commit diff to produce a summary, key changes, complexity estimate, semantic risk factors, and a backport `recommendation`. Also runs hallucination detection on referenced file paths. |
+| `check_customization_compatibility` | LLM call | Checks whether a set of changes is compatible with the fork's declared customizations. Optionally enriches the prompt with actual file content when `ai.enrichCustomizationContext` is enabled. |
+| `reconcile_ai_assessments` | Deterministic | **No LLM call.** Combines the outputs of the two analysis tools into a single `finalRecommendation`. Detects contradictions (e.g. analyze said "apply" but compatibility check failed), applies `requireReviewOnSemanticRisk` escalation, and always resolves ambiguity conservatively. Call this after both analysis tools have run for the same commit. |
+
+Every LLM call is logged to the run's `.prompts.jsonl` file alongside structured quality signals (guards triggered, confidence, hallucination suspects). The detailed report includes a **Decision Quality Metrics** section summarising these signals across the full run.
+
+#### Benchmark replay
+
+The `src/tools/benchmark-replay.ts` script lets you compare two models side-by-side without running a full sync against a real repository. It reads an existing `.prompts.jsonl` log, replays every LLM call with the alternative model, and prints a Markdown comparison report.
+
+```bash
+npx tsx src/tools/benchmark-replay.ts \
+  --log run-1780060224987.prompts.jsonl \
+  --model anthropic/claude-sonnet-4-5 \
+  --provider anthropic \
+  --api-key "$ANTHROPIC_API_KEY" > comparison.md
+```
+
 Custom fork invariants live in a YAML file modeled after [customizations.example.yaml](customizations.example.yaml). This is where you describe the areas that must not be broken by a backport run.
+
+
 
 ## For contributors
 

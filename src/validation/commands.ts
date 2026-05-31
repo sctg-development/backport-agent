@@ -11,9 +11,10 @@
  * file and cannot be extended by the agent at runtime.
  *
  * **No shell interpolation:**
- * Commands are split on whitespace and executed via `execFileSync(bin, args[])`
- * (not through a shell).  This prevents shell metacharacter injection even for
- * allowlisted commands.
+ * Commands are tokenized with a quote-aware splitter (`splitCommand`) and
+ * executed via `execFileSync(bin, args[])` (not through a shell).  This
+ * preserves arguments that contain spaces when wrapped in single or double
+ * quotes, and prevents shell metacharacter injection for allowlisted commands.
  *
  * **Failure fast:**
  * `runValidationSuite` stops at the first failing command so that the agent
@@ -60,6 +61,44 @@ export const ALLOWED_COMMAND_PREFIXES = [
 ]
 
 /**
+ * Splits a command string into tokens, respecting single and double quotes so
+ * that arguments containing spaces are treated as a single token.
+ *
+ * Examples:
+ *  - `"npm run typecheck"` → `["npm", "run", "typecheck"]`
+ *  - `"npx eslint src --rule 'no-console: error'"` → `["npx", "eslint", "src", "--rule", "no-console: error"]`
+ *
+ * Escape sequences inside quotes are intentionally not supported because the
+ * allowlist only permits a narrow, well-known set of commands.
+ *
+ * @param command - Raw command string as provided by the agent.
+ * @returns Array of string tokens: `[binary, ...args]`.
+ */
+function splitCommand(command: string): string[] {
+  const parts: string[] = []
+  let current = ""
+  let inSingle = false
+  let inDouble = false
+  for (const ch of command) {
+    if (ch === "'" && !inDouble) {
+      inSingle = !inSingle
+    } else if (ch === '"' && !inSingle) {
+      inDouble = !inDouble
+    } else if (ch === " " && !inSingle && !inDouble) {
+      if (current) {
+        parts.push(current)
+        current = ""
+      }
+    } else {
+      current += ch
+    }
+  }
+  if (current) parts.push(current)
+  return parts
+}
+
+
+/**
  * Returns `true` if the command starts with an allowlisted prefix.
  *
  * The check is intentionally a simple `startsWith` — it does not parse the
@@ -98,9 +137,11 @@ export function runValidationCommand(command: string, cwd: string): CommandResul
     }
   }
 
-  // Split on whitespace to build the [binary, ...args] array for execFileSync.
-  // This avoids passing a shell-interpolated string.
-  const parts = command.split(" ")
+  // Split into [binary, ...args] using a quote-aware tokenizer so that arguments
+  // containing spaces (wrapped in quotes) are preserved as single tokens.
+  // Commands are then executed via execFileSync without a shell, preventing
+  // metacharacter injection.
+  const parts = splitCommand(command)
   const bin = parts[0]
   const args = parts.slice(1)
 

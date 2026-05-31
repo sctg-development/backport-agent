@@ -66,6 +66,11 @@ function resolveConfigValue(value: string): string | undefined {
  * If none of the above are set the function is a no-op; git will use whatever
  * credentials are already available in the environment (SSH agent, credential helper…).
  *
+ * **Security note:** `GIT_SSH_COMMAND` is executed by git via a shell, so the
+ * key path is wrapped in single quotes with internal single quotes escaped
+ * (`'\''` sequence) to prevent shell injection if the path contains special
+ * characters.
+ *
  * @param config - Validated `SyncConfig` loaded from `config.json`.
  */
 export function applyGitAuth(config: SyncConfig): void {
@@ -75,7 +80,10 @@ export function applyGitAuth(config: SyncConfig): void {
   if (sshKeyPath) {
     // Expand leading ~ to the user's home directory.
     const keyPath = sshKeyPath.replace(/^~(?=\/|$)/, process.env.HOME ?? "")
-    process.env.GIT_SSH_COMMAND = `ssh -i "${keyPath}" -o StrictHostKeyChecking=no -o BatchMode=yes`
+    // Wrap in single quotes and escape embedded single quotes to prevent shell
+    // injection: replace each ' with '\'' (close quote, escaped quote, reopen).
+    const escapedKeyPath = keyPath.replace(/'/g, "'\\''")
+    process.env.GIT_SSH_COMMAND = `ssh -i '${escapedKeyPath}' -o StrictHostKeyChecking=no -o BatchMode=yes`
     process.stderr.write(`[GitAuth] SSH key configured: ${keyPath}\n`)
     return
   }
@@ -109,11 +117,14 @@ export function applyGitAuth(config: SyncConfig): void {
  *  `fork.remote`, the upstream remote is added (or its URL updated) automatically.
  *
  * @param config - Validated `SyncConfig` loaded from `config.json`.
+ * @returns `true` if a network fetch was performed (existing repo case), `false`
+ *          if the repo was freshly cloned (no separate fetch needed).
  * @throws If cloning is required but `fork.url` is not configured.
  */
-export function ensureWorkingDir(config: SyncConfig): void {
+export function ensureWorkingDir(config: SyncConfig): boolean {
   const { workingDir, upstream, fork } = config
   const isGitRepo = existsSync(`${workingDir}/.git`)
+  let fetched = false
 
   // --- Clone if the working directory does not yet exist ---
   if (!isGitRepo) {
@@ -131,15 +142,19 @@ export function ensureWorkingDir(config: SyncConfig): void {
       stdio: ["pipe", "inherit", "inherit"],
     })
     process.stderr.write("[GitInit] Clone complete.\n")
+    // A fresh clone already has up-to-date refs; no separate fetch needed.
+    fetched = false
   } else {
     // --- Fetch all remotes to sync the existing checkout ---
     process.stderr.write(`[GitInit] ${workingDir} found — fetching all remotes...\n`)
     try {
       git(["fetch", "--all", "--prune"], workingDir)
       process.stderr.write("[GitInit] Fetch complete.\n")
+      fetched = true
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
       process.stderr.write(`[GitInit] Warning: fetch failed: ${msg}\n`)
+      fetched = false
     }
   }
 
@@ -164,4 +179,6 @@ export function ensureWorkingDir(config: SyncConfig): void {
       process.stderr.write(`[GitInit] Warning: could not configure upstream remote: ${msg}\n`)
     }
   }
+
+  return fetched
 }

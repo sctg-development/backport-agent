@@ -126,8 +126,12 @@ export function classifyRisk(sha: string, changedFiles: string[], customizations
   // --- Step 1: Check fork customization zones ---
   // Any file that matches a customization's glob pattern triggers high risk,
   // because it means an upstream change directly conflicts with our fork-specific code.
+  // Strip DELETE:/RENAME: prefixes before glob matching so patterns work correctly
+  // regardless of how the file was changed; the prefix is only meaningful for step 4.
   for (const entry of customizations.customizations) {
-    const hits = changedFiles.filter((f) => entry.paths.some((p) => minimatch(f, p)))
+    const hits = changedFiles.filter((f) =>
+      entry.paths.some((p) => minimatch(f.replace(/^(?:DELETE:|RENAME:)/, ""), p)),
+    )
     if (hits.length > 0) {
       matchedCustomizationIds.push(entry.id)
       reasons.push(`Touches customization "${entry.id}": ${hits.join(", ")}`)
@@ -139,7 +143,7 @@ export function classifyRisk(sha: string, changedFiles: string[], customizations
   // Build infrastructure changes (lockfiles, CI, tsconfig, proto) are always high risk
   // regardless of whether they touch a named customization zone.
   for (const pattern of HIGH_RISK_PATTERNS) {
-    const hits = changedFiles.filter((f) => minimatch(f, pattern))
+    const hits = changedFiles.filter((f) => minimatch(f.replace(/^(?:DELETE:|RENAME:)/, ""), pattern))
     if (hits.length > 0) {
       if (level !== "high") level = "high"
       reasons.push(`High-risk file pattern "${pattern}": ${hits.join(", ")}`)
@@ -152,7 +156,7 @@ export function classifyRisk(sha: string, changedFiles: string[], customizations
   // standard validation suite but may still auto-apply.
   if (level === "low") {
     for (const pattern of MEDIUM_RISK_PATTERNS) {
-      const hits = changedFiles.filter((f) => minimatch(f, pattern))
+      const hits = changedFiles.filter((f) => minimatch(f.replace(/^(?:DELETE:|RENAME:)/, ""), pattern))
       if (hits.length > 0) {
         level = "medium"
         reasons.push(`Medium-risk pattern "${pattern}": ${hits.join(", ")}`)

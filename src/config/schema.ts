@@ -226,6 +226,85 @@ export const SyncConfigSchema = z.object({
     .default(() => ({} as any)),
 
   /**
+   * AI quality guardrails and opt-in quality features.
+   *
+   * Controls confidence thresholds, post-processing guards applied to every AI
+   * tool output, and optional features that trade higher cost / latency for
+   * improved reliability.
+   */
+  ai: z
+    .object({
+      /**
+       * Minimum confidence level required to auto-apply a conflict resolution
+       * produced by `resolve_conflict_with_ai` without requesting human review.
+       *
+       * - `"medium"` (default): auto-apply when confidence is "medium" or "high".
+       * - `"high"`:             only auto-apply when the model is highly confident;
+       *                          all "medium" resolutions are routed to human review.
+       */
+      minAutoApplyConfidence: z
+        .enum(["high", "medium"])
+        .default("medium")
+        .describe("Minimum AI confidence to auto-apply conflict resolutions without human review"),
+
+      /**
+       * When `true`, any commit where `analyze_commit_for_backport` returns at least
+       * one `semanticRiskFactor` is automatically flagged for human review, regardless
+       * of the model's `recommendation` field.
+       * Defaults to `false`.
+       */
+      requireReviewOnSemanticRisk: z
+        .boolean()
+        .default(false)
+        .describe("Flag commits with semantic risk factors for human review even if AI recommends apply"),
+
+      /**
+       * When `true`, `resolve_conflict_with_ai` runs a second independent call using
+       * `models.powerful` and compares the two resolved contents.  If the outputs
+       * diverge significantly (line-level Dice similarity below `conflictConsensusThreshold`),
+       * the confidence is downgraded to `"low"` to trigger human review.
+       *
+       * **Disabled by default** — enabling it doubles the token cost and latency of
+       * every conflict-resolution call.  Enable for repositories where an incorrect
+       * auto-resolution would have a large blast radius.
+       */
+      enableConflictConsensus: z
+        .boolean()
+        .default(false)
+        .describe("Run a second independent model call to validate conflict resolutions (doubles cost/latency)"),
+
+      /**
+       * Line-similarity threshold (Dice coefficient, 0–1) used when
+       * `enableConflictConsensus` is `true`.  Two resolutions whose trimmed-line
+       * similarity falls below this value are considered divergent and trigger a
+       * confidence downgrade to `"low"`.
+       * Defaults to `0.7` (70 % of unique trimmed lines must match).
+       */
+      conflictConsensusThreshold: z
+        .number()
+        .min(0)
+        .max(1)
+        .default(0.7)
+        .describe("Minimum Dice line-similarity (0–1) for consensus; below threshold → confidence=low"),
+
+      /**
+       * When `true`, `check_customization_compatibility` reads the actual content of
+       * files matching each customization pattern and includes up to 2 000-character
+       * snippets per file in the LLM prompt.  This gives the model concrete code to
+       * reason about rather than purely abstract descriptions.
+       * Defaults to `true`.
+       *
+       * Set to `false` to reduce prompt token consumption for repositories with very
+       * large customization files.
+       */
+      enrichCustomizationContext: z
+        .boolean()
+        .default(true)
+        .describe("Include actual file content snippets in check_customization_compatibility prompts"),
+    })
+    .default(() => ({} as any)),
+
+  /**
    * Deterministic merge-strategy overrides by file path.
    *
    * Each entry is either a glob pattern (matched via `minimatch`) or a regex

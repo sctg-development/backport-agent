@@ -231,6 +231,9 @@ Produce a draft pull request with a clear report. Never push directly to the mai
 async function main() {
   // --- Config loading ---
   const config = loadConfig(process.env._CLI_CONFIG_PATH)
+  // Clear the CLI API key from process.env immediately after use so it is not
+  // inherited by child processes spawned later (e.g. git, npm validation commands).
+  delete process.env._CLI_API_KEY
 
   // --- Authentication + working directory setup ---
   // applyGitAuth sets process-level env vars (GIT_SSH_COMMAND or GIT_CONFIG_*)
@@ -238,12 +241,16 @@ async function main() {
   // ensureWorkingDir clones the fork repo if it doesn't exist, or fetches all
   // remotes if it does, bringing the checkout up to date before the agent starts.
   applyGitAuth(config)
-  ensureWorkingDir(config)
+  const alreadyFetched = ensureWorkingDir(config)
 
   const upstreamRef = `${config.upstream.remote}/${config.upstream.branch}`
   const forkRef = `${config.fork.remote}/${config.fork.branch}`
 
-  fetchRemotes(config.workingDir, config.upstream.remote, config.fork.remote, config.sync.initialFetchDepth)
+  // ensureWorkingDir already called `git fetch --all --prune` for existing repos;
+  // skip the targeted fetchRemotes to avoid a redundant network round-trip.
+  if (!alreadyFetched) {
+    fetchRemotes(config.workingDir, config.upstream.remote, config.fork.remote, config.sync.initialFetchDepth)
+  }
   ensureMergeBase(config.workingDir, upstreamRef, forkRef, config.sync.maxFetchDepth)
 
   const allCandidates = listCandidateCommits(config.workingDir, upstreamRef, forkRef)
@@ -300,8 +307,8 @@ async function main() {
   const promptLogPath = joinPath(reportDir, `run-${Date.now()}.prompts.jsonl`)
   process.stderr.write(`[PromptLogger] Writing sub-agent logs to: ${promptLogPath}\n`)
 
-  const reportTool = makeReportTool(config, promptLogPath) // 1 terminal tool (completesRun: true)
   const resolvedApiKey = resolveApiKey(config)
+  const reportTool = makeReportTool(config, promptLogPath, config.models.provider, resolvedApiKey) // 1 terminal tool (completesRun: true)
   const aiTools = makeAiTools(config, promptLogPath, config.models.provider, resolvedApiKey) // 3 AI-powered analysis tools
 
   // --- SDK built-in tools ---

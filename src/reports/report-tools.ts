@@ -43,9 +43,13 @@ import type { SyncConfig } from "../config/schema.js"
 // ---------------------------------------------------------------------------
 
 /**
- * Shape of a single entry in the `.prompts.jsonl` log file.
+ * Shape of a single prompt-entry in the `.prompts.jsonl` log file.
+ * Extended fields (confidence, guards, hallucinationSuspectsCount…) are
+ * optional because they were added progressively — older log files may not
+ * carry them.
  */
 interface PromptLogEntry {
+  type?: "prompt" // absent or "prompt" for backward compat
   timestamp: string
   tool: string
   model: string
@@ -58,27 +62,61 @@ interface PromptLogEntry {
   cacheReadTokens?: number
   cacheWriteTokens?: number
   totalCost?: number
+  // Quality fields added by the improved ai-tools (Improvement 1 / 5 / 6 / 8)
+  originalConfidence?: string
+  effectiveConfidence?: string
+  hasConflictMarkers?: boolean
+  syntaxValid?: boolean
+  consensusFailure?: boolean
+  guards?: string[]
+  recommendation?: string
+  backportComplexity?: string
+  semanticRiskFactorsCount?: number
+  hallucinationSuspectsCount?: number
+  compatible?: boolean
+  affectedCount?: number
+  semanticConflictsCount?: number
+  fileContentEnriched?: boolean
 }
 
 /**
- * Reads the JSONL prompt log, returning all valid entries.
+ * Shape of a structured audit event in the `.prompts.jsonl` log file.
+ * Audit events are written unconditionally at the tool layer (Improvement 9).
+ */
+interface AuditEventEntry {
+  type: "audit_event"
+  timestamp: string
+  tool: string
+  event: string
+  details?: Record<string, unknown>
+}
+
+/** Union of all possible JSONL log record shapes. */
+type LogEntry = PromptLogEntry | AuditEventEntry
+
+/**
+ * Reads the JSONL prompt log, returning prompt entries and audit events separately.
  * Silently skips malformed lines so a corrupt log cannot block the report.
  */
-function readPromptLog(logPath: string): PromptLogEntry[] {
-  if (!existsSync(logPath)) return []
+function readPromptLog(logPath: string): { prompts: PromptLogEntry[]; auditEvents: AuditEventEntry[] } {
+  if (!existsSync(logPath)) return { prompts: [], auditEvents: [] }
   try {
-    return readFileSync(logPath, "utf8")
+    const entries = readFileSync(logPath, "utf8")
       .split("\n")
       .filter(Boolean)
       .flatMap((line) => {
         try {
-          return [JSON.parse(line) as PromptLogEntry]
+          return [JSON.parse(line) as LogEntry]
         } catch {
           return []
         }
       })
+    return {
+      prompts: entries.filter((e): e is PromptLogEntry => e.type !== "audit_event"),
+      auditEvents: entries.filter((e): e is AuditEventEntry => e.type === "audit_event"),
+    }
   } catch {
-    return []
+    return { prompts: [], auditEvents: [] }
   }
 }
 
@@ -86,12 +124,22 @@ function readPromptLog(logPath: string): PromptLogEntry[] {
  * Instantiates a minimal sub-Agent with no tools for a single reasoning turn.
  * Identical in purpose to the helper in `ai-tools.ts` but local to avoid a
  * cross-module import cycle.
+ *
+ * @param modelId      - Model identifier to use for the sub-agent.
+ * @param systemPrompt - System prompt to inject.
+ * @param providerId   - Provider identifier (e.g. `"openai"`, `"anthropic"`).
+ * @param apiKey       - API key for the provider, or `undefined` if using env-based auth.
  */
-function makeReportSubAgent(modelId: string, systemPrompt: string): Agent {
+function makeReportSubAgent(
+  modelId: string,
+  systemPrompt: string,
+  providerId: string,
+  apiKey: string | undefined,
+): Agent {
   return new Agent({
-    providerId: "keypoollive",
+    providerId,
     modelId,
-    apiKey: "auto",
+    apiKey,
     systemPrompt,
     tools: [],
   })
@@ -111,10 +159,17 @@ function safeFence(content: string): string {
 /**
  * Calls the fast model to produce a Mermaid flowchart summarising the agent run.
  * Returns a fenced mermaid code block string, or a fallback placeholder on error.
+ *
+ * @param config     - Validated `SyncConfig` — used for `models.fast` and `models.provider`.
+ * @param runSummary - Compact plain-text description of the completed run.
+ * @param providerId - Provider identifier forwarded to the sub-agent.
+ * @param apiKey     - API key forwarded to the sub-agent.
  */
 async function generateMermaidDiagram(
   config: SyncConfig,
   runSummary: string,
+  providerId: string,
+  apiKey: string | undefined,
 ): Promise<string> {
   const systemPrompt = `You are a technical diagram generator. When given a summary of a Git backport agent run, \
 produce a single Mermaid flowchart (flowchart TD) that visually represents: \
@@ -128,7 +183,7 @@ Output ONLY the raw Mermaid code, no prose, no code fence.`
   const userPrompt = `Agent run summary:\n\n${runSummary}\n\nOutput the Mermaid flowchart now.`
 
   try {
-    const subAgent = makeReportSubAgent(config.models.fast, systemPrompt)
+    const subAgent = makeReportSubAgent(config.models.fast, systemPrompt, providerId, apiKey)
     const result = await subAgent.run(userPrompt)
     const raw = (result.outputText ?? "").trim()
     // Strip any accidental code fence if the model added one.
@@ -186,11 +241,18 @@ export type CommitResult = z.infer<typeof CommitResultSchema>
 /**
  * Builds and returns the `generate_report` agent tool.
  *
- * @param config       - Validated `SyncConfig` — used for model IDs and `report.destination`.
+ * @param config        - Validated `SyncConfig` — used for model IDs and `report.destination`.
  * @param promptLogPath - Absolute path to the JSONL file written by `logPrompt()` in ai-tools.ts.
+ * @param providerId    - Provider identifier used to instantiate sub-agents (e.g. `"openai"`).
+ * @param apiKey        - Resolved API key for the provider, or `undefined` if env-based.
  * @returns A single agent tool: `generate_report` (with `completesRun: true`).
  */
-export function makeReportTool(config: SyncConfig, promptLogPath: string) {
+export function makeReportTool(
+  config: SyncConfig,
+  promptLogPath: string,
+  providerId: string,
+  apiKey: string | undefined,
+) {
   return defineTool({
     name: "generate_report",
     description:
@@ -326,13 +388,13 @@ export function makeReportTool(config: SyncConfig, promptLogPath: string) {
         `Applied (${applied.length}): ${applied.map((r) => `${r.sha.slice(0, 8)} [${r.riskLevel}] ${r.subject}`).join(" | ") || "none"}`,
         `Blocked (${blockedCommits.length}): ${blockedCommits.map((c) => `${c.sha.slice(0, 8)} — ${c.reason}`).join(" | ") || "none"}`,
         `Needs review (${needsReview.length}): ${needsReview.map((r) => r.sha.slice(0, 8)).join(", ") || "none"}`,
-        `AI calls: ${readPromptLog(promptLogPath).map((e) => `${e.tool}(${e.model}, ${e.durationMs}ms)`).join(", ") || "none"}`,
+        `AI calls: ${readPromptLog(promptLogPath).prompts.map((e) => `${e.tool}(${e.model}, ${e.durationMs}ms)`).join(", ") || "none"}`,
       ].join("\n")
 
-      const mermaidBlock = await generateMermaidDiagram(config, runSummaryForDiagram)
+      const mermaidBlock = await generateMermaidDiagram(config, runSummaryForDiagram, providerId, apiKey)
 
       // Read and format the prompt log entries.
-      const promptEntries = readPromptLog(promptLogPath)
+      const { prompts: promptEntries, auditEvents } = readPromptLog(promptLogPath)
 
       const detailedLines: string[] = [
         "# Backport Agent — Detailed Run Report",
@@ -445,6 +507,134 @@ export function makeReportTool(config: SyncConfig, promptLogPath: string) {
           ),
           "",
         )
+      }
+
+      // -----------------------------------------------------------------------
+      // Decision Quality Metrics section (Improvement 7)
+      // -----------------------------------------------------------------------
+      {
+        // Conflict resolution confidence distribution.
+        const conflictCalls = promptEntries.filter((e) => e.tool === "resolve_conflict_with_ai")
+        const guardedCalls = conflictCalls.filter((e) => e.guards && (e.guards as string[]).length > 0)
+        const markerCalls = conflictCalls.filter((e) => e.hasConflictMarkers)
+        const syntaxFailCalls = conflictCalls.filter((e) => e.syntaxValid === false)
+        const consensusFailCalls = conflictCalls.filter((e) => e.consensusFailure === true)
+        const confidenceDist = { high: 0, medium: 0, low: 0 }
+        for (const e of conflictCalls) {
+          const c = (e.effectiveConfidence ?? e.originalConfidence ?? "unknown") as string
+          if (c === "high" || c === "medium" || c === "low") confidenceDist[c]++
+        }
+
+        // Hallucination suspects across analyze calls.
+        const analyzeCalls = promptEntries.filter((e) => e.tool === "analyze_commit_for_backport")
+        const totalHallucinationSuspects = analyzeCalls.reduce(
+          (sum, e) => sum + (e.hallucinationSuspectsCount ?? 0),
+          0,
+        )
+
+        // Contradiction events from reconcile_ai_assessments audit log.
+        const contradictionEvents = auditEvents.filter(
+          (e) => e.tool === "reconcile_ai_assessments" && e.event === "contradiction_detected",
+        )
+
+        // Compatibility calls enriched with file context.
+        const compatCalls = promptEntries.filter((e) => e.tool === "check_customization_compatibility")
+        const enrichedCompatCalls = compatCalls.filter((e) => e.fileContentEnriched === true)
+        const incompatibleCalls = compatCalls.filter((e) => e.compatible === false)
+
+        detailedLines.push(
+          "## Decision Quality Metrics",
+          "",
+          "> Automated quality signals derived from tool output guards, schema validation,",
+          "> hallucination detection, and consensus checks.  Review flagged items manually.",
+          "",
+        )
+
+        if (conflictCalls.length > 0) {
+          detailedLines.push(
+            "### Conflict Resolution Quality",
+            "",
+            `| Metric | Value |`,
+            `|---|---|`,
+            `| Total conflict resolutions | ${conflictCalls.length} |`,
+            `| Confidence: high / medium / low | ${confidenceDist.high} / ${confidenceDist.medium} / ${confidenceDist.low} |`,
+            `| Conflict markers detected (guard triggered) | ${markerCalls.length} |`,
+            `| Syntax balance failures | ${syntaxFailCalls.length} |`,
+            `| Consensus divergences (if enabled) | ${consensusFailCalls.length} |`,
+            `| Total guard activations | ${guardedCalls.length} |`,
+            "",
+          )
+          if (guardedCalls.length > 0) {
+            detailedLines.push("**Guard details:**", "")
+            for (const e of guardedCalls) {
+              detailedLines.push(`- \`${e.tool}\` — guards: ${(e.guards as string[]).join(", ")}`)
+            }
+            detailedLines.push("")
+          }
+        }
+
+        if (analyzeCalls.length > 0) {
+          detailedLines.push(
+            "### Commit Analysis Quality",
+            "",
+            `| Metric | Value |`,
+            `|---|---|`,
+            `| Total analyze calls | ${analyzeCalls.length} |`,
+            `| Commits with semantic risk factors | ${analyzeCalls.filter((e) => (e.semanticRiskFactorsCount ?? 0) > 0).length} |`,
+            `| Possible hallucinated references (total) | ${totalHallucinationSuspects} |`,
+            "",
+          )
+        }
+
+        if (compatCalls.length > 0) {
+          detailedLines.push(
+            "### Compatibility Check Quality",
+            "",
+            `| Metric | Value |`,
+            `|---|---|`,
+            `| Total compatibility checks | ${compatCalls.length} |`,
+            `| Checks with file content enrichment | ${enrichedCompatCalls.length} |`,
+            `| Incompatible results | ${incompatibleCalls.length} |`,
+            "",
+          )
+        }
+
+        if (contradictionEvents.length > 0) {
+          detailedLines.push(
+            "### ⚠️ AI Assessment Contradictions",
+            "",
+            `> ${contradictionEvents.length} contradiction(s) were detected by \`reconcile_ai_assessments\`.`,
+            "> These are cases where analyze_commit recommended apply but check_customization found issues.",
+            "",
+          )
+          for (const ev of contradictionEvents) {
+            const d = ev.details ?? {}
+            detailedLines.push(
+              `- **SHA**: \`${String(d.sha ?? "?").slice(0, 8)}\`  analyze=\`${d.analyzeRecommendation ?? "?"}\`  ` +
+                `compatible=\`${d.compatibilityCompatible ?? "?"}\`  final=\`${d.finalRecommendation ?? "?"}\``,
+            )
+          }
+          detailedLines.push("")
+        }
+
+        if (auditEvents.length > 0) {
+          detailedLines.push(
+            "### Audit Event Timeline",
+            "",
+            `| Timestamp | Tool | Event | Details |`,
+            `|---|---|---|---|`,
+            ...auditEvents.map((ev) => {
+              const detailStr = ev.details
+                ? Object.entries(ev.details)
+                    .slice(0, 3)
+                    .map(([k, v]) => `${k}=${JSON.stringify(v).slice(0, 40)}`)
+                    .join(", ")
+                : ""
+              return `| ${ev.timestamp.slice(11, 19)} | \`${ev.tool}\` | \`${ev.event}\` | ${detailStr} |`
+            }),
+            "",
+          )
+        }
       }
 
       // Write the detailed report to disk (skipped in dry-run mode).
