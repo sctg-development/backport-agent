@@ -1,3 +1,4 @@
+[![Npm package version](https://badgen.net/npm/v/@sctg/backport-agent)](https://npmjs.com/package/@sctg/backport-agent)[![TypeScript](https://badgen.net/badge/icon/typescript?icon=typescript&label)](https://typescriptlang.org)
 # Backport Agent
 
 A deterministic IA powered agent for keeping a heavily customized Git fork in sync with an active upstream repository.
