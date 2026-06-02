@@ -32,9 +32,9 @@
   },
   "dependencies": {
     "@octokit/rest": "^22.0.1",
-    "@sctg/cline-sdk": "3.86.1-beta.20260601192122",
+    "@sctg/cline-sdk": "3.86.2-beta.20260602165742",
     "dotenv": "^17.4.2",
-    "js-yaml": "^4.1.0",
+    "js-yaml": "^4.2.0",
     "minimatch": "^10.0.1",
     "zod": "^4.4.3"
   },
@@ -43,8 +43,8 @@
     "@types/node": "^22.19.19",
     "tsx": "^4.19.0",
     "typescript": "^6.0.3",
-    "vite": "^8.0.14",
-    "vitest": "^4.1.7"
+    "vite": "^8.0.16",
+    "vitest": "^4.1.8"
   },
   "publishConfig": {
     "access": "public"
