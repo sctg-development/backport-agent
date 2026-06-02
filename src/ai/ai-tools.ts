@@ -49,6 +49,76 @@ import { globSync } from "node:fs"
 import { join as joinPath } from "node:path"
 import { minimatch } from "minimatch"
 
+// Timeout error detection regex - matches common timeout error messages
+const TIMEOUT_ERROR_PATTERNS = [
+  /body timeout/i,
+  /request timeout/i,
+  /socket timeout/i,
+  /ETIMEDOUT/i,
+  /ESOCKETTIMEDOUT/i,
+  /ECONNABORTED/i,
+  /deadline exceeded/i,
+  /response timeout/i,
+  /read timeout/i,
+  /connect timeout/i,
+  /timed out/i,
+  /timeout error/i,
+  /timeout after/i,
+  /timeout: /i,
+  / timed out/i,
+  / timeout /i,
+]
+
+/**
+ * Checks if an error message indicates a timeout error
+ * @param errorMessage - The error message to check
+ * @returns true if the error is a timeout error, false otherwise
+ */
+function isTimeoutError(errorMessage: string): boolean {
+  return TIMEOUT_ERROR_PATTERNS.some(pattern => pattern.test(errorMessage))
+}
+
+/**
+ * Logs a timeout error with enhanced verbosity
+ * @param logPath - Path to the JSONL log file
+ * @param toolName - Name of the tool that timed out
+ * @param errorMessage - The timeout error message
+ * @param context - Additional context about what was being processed
+ */
+function logTimeoutError(logPath: string, toolName: string, errorMessage: string, context: Record<string, unknown>): void {
+  const timestamp = new Date().toISOString()
+  const errorRecord = {
+    type: "timeout_error",
+    timestamp,
+    tool: toolName,
+    error: errorMessage,
+    ...context
+  }
+
+  // Log to stderr with high visibility
+  process.stderr.write(`\n[TIMEOUT ERROR] ${timestamp} - ${toolName}\n`)
+  process.stderr.write(`[TIMEOUT ERROR] Error: ${errorMessage}\n`)
+  if (context.sha) {
+    process.stderr.write(`[TIMEOUT ERROR] Commit SHA: ${context.sha}\n`)
+  }
+  if (context.commitMessage) {
+    const shortMessage = typeof context.commitMessage === 'string' ? context.commitMessage.slice(0, 100) : ''
+    process.stderr.write(`[TIMEOUT ERROR] Commit: ${shortMessage}${shortMessage.length === 100 ? '...' : ''}\n`)
+  }
+  if (context.durationMs) {
+    process.stderr.write(`[TIMEOUT ERROR] Duration: ${context.durationMs}ms\n`)
+  }
+  process.stderr.write(`[TIMEOUT ERROR] Tool: ${toolName}\n`)
+  process.stderr.write('[TIMEOUT ERROR] See prompt log for full details\n')
+
+  // Also log to the JSONL file for audit trail
+  try {
+    appendFileSync(logPath, JSON.stringify(errorRecord) + "\n", "utf8")
+  } catch {
+    process.stderr.write(`[TimeoutLogger] Warning: could not write timeout error to ${logPath}\n`)
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Zod schemas for AI tool output validation (Improvement 1)
 // ---------------------------------------------------------------------------
@@ -635,6 +705,18 @@ export function makeAiTools(config: SyncConfig, logPath: string, providerId: str
           }
         } catch (err) {
           lastError = err instanceof Error ? err.message : String(err)
+
+          // Check for timeout errors and log with enhanced verbosity
+          if (isTimeoutError(lastError)) {
+            logTimeoutError(logPath, "resolve_conflict_with_ai", lastError, {
+              filePath,
+              commitMessage,
+              modelId,
+              label,
+              durationMs: 0 // We don't have the exact duration in catch block
+            })
+          }
+
           process.stderr.write(
             `[resolve_conflict_with_ai] ${label} model (${modelId}) failed: ${lastError.slice(0, 120)} — ${
               label === "specialist" ? "retrying with powerful model" : "giving up"
@@ -736,6 +818,19 @@ export function makeAiTools(config: SyncConfig, logPath: string, providerId: str
         const t0 = Date.now()
         const result = await subAgent.run(userPrompt)
         const durationMs = Date.now() - t0
+
+        // Check for timeout errors and log with enhanced verbosity
+        if (result.error) {
+          const errorMessage = result.error instanceof Error ? result.error.message : String(result.error)
+          if (isTimeoutError(errorMessage)) {
+            logTimeoutError(logPath, "analyze_commit_for_backport", errorMessage, {
+              sha,
+              commitMessage,
+              durationMs,
+              model: config.models.fast
+            })
+          }
+        }
 
         // --- Improvement 1: Zod schema validation ---
         const rawOutput = extractJson<unknown>(result.outputText ?? "")
@@ -940,6 +1035,18 @@ export function makeAiTools(config: SyncConfig, logPath: string, providerId: str
         const t0 = Date.now()
         const result = await subAgent.run(userPrompt)
         const durationMs = Date.now() - t0
+
+        // Check for timeout errors and log with enhanced verbosity
+        if (result.error) {
+          const errorMessage = result.error instanceof Error ? result.error.message : String(result.error)
+          if (isTimeoutError(errorMessage)) {
+            logTimeoutError(logPath, "check_customization_compatibility", errorMessage, {
+              durationMs,
+              model: config.models.fast,
+              customizationCount: customizations.length
+            })
+          }
+        }
 
         // --- Improvement 1: Zod schema validation ---
         const rawOutput = extractJson<unknown>(result.outputText ?? "")

@@ -518,6 +518,37 @@ async function main() {
 main()
   .then(() => process.exit(0))
   .catch((err) => {
-    console.error("Fatal error:", err instanceof Error ? err.message : String(err))
+    const errorMessage = err instanceof Error ? err.message : String(err)
+    console.error("Fatal error:", errorMessage)
+
+    // Enhanced error logging for timeout errors
+    const TIMEOUT_ERROR_PATTERNS = [
+      /timeout/i,
+      /timed out/i,
+      /body timeout/i,
+      /request timeout/i,
+      /socket timeout/i,
+      /ETIMEDOUT/i,
+      /ESOCKETTIMEDOUT/i,
+      /ECONNABORTED/i,
+      /deadline exceeded/i,
+      /response timeout/i,
+      /read timeout/i,
+      /connect timeout/i,
+    ]
+
+    if (TIMEOUT_ERROR_PATTERNS.some(pattern => pattern.test(errorMessage))) {
+      console.error("\n[TIMEOUT DETECTED] This appears to be a timeout error")
+      console.error("[TIMEOUT DETECTED] The operation took too long to complete")
+      console.error("[TIMEOUT DETECTED] Check the verbose logs above for specific tool/operation details")
+      console.error("[TIMEOUT DETECTED] Consider increasing timeout settings or checking network connectivity")
+    }
+
+    // Provide stack trace if available and in verbose mode
+    if (process.env.VERBOSE === "true" && err instanceof Error && err.stack) {
+      console.error("\nStack trace:")
+      console.error(err.stack)
+    }
+
     process.exit(1)
   })
