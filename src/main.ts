@@ -432,8 +432,7 @@ async function main() {
     `Synchronize the fork \`${config.fork.repo}@${config.fork.branch}\` with upstream ` +
     `\`${config.upstream.repo}@${config.upstream.branch}\`.${dryRunNote}\n\n` +
     `Working directory: ${config.workingDir}\n` +
-    `Max commits per run: ${config.sync.maxCommitsPerRun}\n` +
-    `Batch size: ${config.sync.batchSize}`
+    `Max commits per run: ${config.sync.maxCommitsPerRun}`
 
   console.error(`\n=== Backport Agent starting${dryRunNote} ===\n`)
 

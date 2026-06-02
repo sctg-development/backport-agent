@@ -8,3 +8,4 @@ config.json
 run-*.prompts.jsonl
 dist/
 .backport-agent/
+.DS_Store
