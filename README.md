@@ -135,6 +135,30 @@ The main runtime configuration lives in a JSON file modeled after [config.exampl
 
 The `provider` field in the `models` section is required. It accepts any provider ID supported by `@sctg/cline-sdk` (e.g. `"keypoollive"`, `"anthropic"`, `"openai"`, `"mistral"`, `"gemini"`). The API key is resolved from the `apiKey` field, a `$ENV_VAR` reference, or the implicit `{PROVIDER_UPPER}_API_KEY` environment variable.
 
+### `sync.prNumberMatching` — Manual backport detection (optional)
+
+By default, the agent detects already-applied commits using three signals: `git cherry` patch comparison, exact subject-line match, and the `cherry picked from commit <sha>` annotation added by `git cherry-pick -x`.
+
+When a commit is cherry-picked manually (conflict resolution, subject rewrite, no `-x` flag), all three signals can miss it. Enabling `prNumberMatching` adds a fourth signal: if a fork commit references the same upstream PR number **and** the two subjects are similar enough (Jaccard word-token score), the commit is considered already applied.
+
+```json
+"sync": {
+  "prNumberMatching": {
+    "enabled": true,
+    "minSubjectSimilarity": 0.4
+  }
+}
+```
+
+| Field | Default | Description |
+|---|---|---|
+| `enabled` | `false` | Activate PR-number-based duplicate detection. |
+| `minSubjectSimilarity` | `0.4` | Minimum Jaccard word-token similarity (0–1) between the upstream subject and the matching fork subject. Lower → more permissive (risk of false positives). Higher → stricter (may miss heavily reworded backports). |
+
+**Example:** upstream commit `Move \`sdk/apps/\` to \`apps/\` (#11200)` is detected as already applied when the fork contains `feat(backport): Move sdk/apps/ to apps/ (cline#11200)` — the PR number matches and the similarity score (~0.67) exceeds the default threshold.
+
+Enable this only when your team consistently includes the upstream PR number in manual backport commit messages.
+
 ### `ai` section — Quality guardrails (optional)
 
 The optional `ai` section configures the AI quality guardrails introduced to improve backport reliability. All fields have safe defaults and the section can be omitted entirely.

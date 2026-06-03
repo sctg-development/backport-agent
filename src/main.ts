@@ -253,7 +253,12 @@ async function main() {
   }
   ensureMergeBase(config.workingDir, upstreamRef, forkRef, config.sync.maxFetchDepth)
 
-  const allCandidates = listCandidateCommits(config.workingDir, upstreamRef, forkRef)
+  const allCandidates = listCandidateCommits(
+    config.workingDir,
+    upstreamRef,
+    forkRef,
+    config.sync.prNumberMatching.enabled ? config.sync.prNumberMatching : undefined,
+  )
 
   // --- --list-backport-needed: print pending commits and exit without running the agent ---
   if (process.env._CLI_LIST_BACKPORT_NEEDED === "true") {

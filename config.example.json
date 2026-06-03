@@ -25,7 +25,13 @@
     "batchSize": 5,
     "dryRun": true,
     "createPullRequest": true,
-    "branchPrefix": "sync/upstream-"
+    "branchPrefix": "sync/upstream-",
+    "prNumberMatching": {
+      "_comment": "DISABLED BY DEFAULT. Enable to detect manually-applied backports that were reworded but kept the upstream PR number.",
+      "enabled": false,
+      "_comment_minSubjectSimilarity": "Jaccard word-token similarity threshold (0..1). Lower = more permissive (risk of false positives). Default 0.4.",
+      "minSubjectSimilarity": 0.4
+    }
   },
   "models": {
     "_comment_provider": "Any provider supported by @sctg/cline-sdk: \"keypoollive\", \"anthropic\", \"openai\", \"mistral\", \"gemini\", etc.",

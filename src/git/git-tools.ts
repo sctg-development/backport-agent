@@ -131,6 +131,7 @@ export function makeGitTools(config: SyncConfig) {
         workingDir,
         `${upstream.remote}/${upstream.branch}`,
         `${fork.remote}/${fork.branch}`,
+        sync.prNumberMatching.enabled ? sync.prNumberMatching : undefined,
       )
       // Filter out already-applied commits and cap to the configured run limit.
       const pending = candidates.filter((c) => !c.alreadyApplied).slice(0, sync.maxCommitsPerRun)
