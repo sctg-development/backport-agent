@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "skills": {
+    "cline-sdk": {
+      "source": "TEA-ching/cline",
+      "ref": "keypool-docs-deploy",
+      "sourceType": "github",
+      "skillPath": ".agents/skills/cline-sdk/SKILL.md",
+      "computedHash": "ad2587c6fea404abc5fd0e967b4b778c37be463a504d9b334033e443f1618173"
+    }
+  }
+}
