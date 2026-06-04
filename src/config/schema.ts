@@ -158,6 +158,35 @@ export const SyncConfigSchema = z.object({
        * Defaults to `"sync/upstream-"`.
        */
       branchPrefix: z.string().default("sync/upstream-"),
+
+      /**
+       * Heuristic detection of manually-applied backports by PR number.
+       *
+       * When enabled, `list_candidate_commits` will also mark an upstream commit
+       * as already applied if a fork commit references the same PR number **and**
+       * the two subjects exceed `minSubjectSimilarity` (Jaccard word-token score, 0–1).
+       *
+       * Use this when backports are sometimes applied manually without
+       * `git cherry-pick -x`, which would otherwise leave them unlisted by the
+       * standard `git cherry` + subject-match detection.
+       *
+       * **Disabled by default** — enable only when your team consistently includes
+       * the upstream PR number in manual backport commit messages.
+       */
+      prNumberMatching: z
+        .object({
+          /** Enable PR-number-based duplicate detection. Defaults to `false`. */
+          enabled: z.boolean().default(false),
+          /**
+           * Minimum Jaccard word-token similarity (0–1) between the upstream subject
+           * and a fork subject that shares the same PR number.
+           * Lower → more permissive (risk of false positives).
+           * Higher → stricter (may miss heavily reworded manual backports).
+           * Defaults to `0.4`.
+           */
+          minSubjectSimilarity: z.number().min(0).max(1).default(0.4),
+        })
+        .default(() => ({ enabled: false, minSubjectSimilarity: 0.4 })),
     })
     // Allow omitting the entire sync block in config.json; each field has its own default.
     .default(() => ({} as any)),

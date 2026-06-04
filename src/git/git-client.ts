@@ -110,6 +110,59 @@ export function ensureMergeBase(
 }
 
 /**
+ * Options that control optional heuristic detection passes in
+ * `listCandidateCommits`.
+ */
+export interface PrNumberMatchingOptions {
+  /** Must be `true` to activate Signal 4. */
+  enabled: boolean
+  /**
+   * Jaccard word-token similarity threshold (0–1).  An upstream commit is only
+   * considered already applied when both the PR number matches **and** the
+   * similarity between the upstream subject and the matching fork subject meets
+   * this floor.  Prevents false positives from accidental PR number collisions.
+   */
+  minSubjectSimilarity: number
+}
+
+/**
+ * Computes a Jaccard word-token similarity score (0–1) between two commit subjects.
+ *
+ * Both strings are lowercased, PR-number references (e.g. `(#11200)`,
+ * `(cline#11200)`) are stripped, and the result is tokenised on non-word
+ * boundaries.  Single-character tokens are discarded as noise.
+ *
+ * A score of `1.0` means both subjects share all the same meaningful words;
+ * `0.0` means they share none.
+ *
+ * @example
+ * subjectSimilarity(
+ *   "Move `sdk/apps/` to `apps/` (#11200)",
+ *   "feat(backport): Move sdk/apps/ to apps/ (cline#11200)",
+ * ) // → ~0.67
+ */
+export function subjectSimilarity(a: string, b: string): number {
+  const tokenize = (s: string): Set<string> =>
+    new Set(
+      s
+        .toLowerCase()
+        // Strip PR / issue refs such as (#11200) or (cline#11200).
+        .replace(/\([^)]*#\d+[^)]*\)/g, " ")
+        // Strip common markdown / shell punctuation.
+        .replace(/[`'"*()[\]{}/\\:]/g, " ")
+        .split(/\W+/)
+        .filter((t) => t.length > 1),
+    )
+
+  const tokA = tokenize(a)
+  const tokB = tokenize(b)
+  if (tokA.size === 0 && tokB.size === 0) return 1
+  const intersection = [...tokA].filter((t) => tokB.has(t)).length
+  const union = new Set([...tokA, ...tokB]).size
+  return union === 0 ? 0 : intersection / union
+}
+
+/**
  * Lists all upstream commits that are not yet present in the fork branch.
  *
  * Uses `git cherry` which compares patch content (not just SHA) so that commits
@@ -133,15 +186,24 @@ export function ensureMergeBase(
  *     includes a `cherry picked from commit <sha>` annotation (added
  *     automatically by `git cherry-pick -x`).
  *
- * @param cwd         - Absolute path to the repository working directory.
- * @param upstreamRef - Full ref for the upstream branch, e.g. `"upstream/main"`.
- * @param forkRef     - Full ref for the fork branch, e.g. `"origin/main"`.
+ * An optional third signal can be activated via `prNumberMatching`:
+ *  3. **PR number + similarity** – the fork contains a commit whose subject
+ *     references the same upstream PR number (e.g. `(#11200)` → `(cline#11200)`)
+ *     and whose word-token Jaccard similarity with the upstream subject meets
+ *     `minSubjectSimilarity`.  Catches manual backports that were reworded but
+ *     kept the PR number reference.  Disabled by default.
+ *
+ * @param cwd              - Absolute path to the repository working directory.
+ * @param upstreamRef      - Full ref for the upstream branch, e.g. `"upstream/main"`.
+ * @param forkRef          - Full ref for the fork branch, e.g. `"origin/main"`.
+ * @param prNumberMatching - Optional Signal 4 options (disabled when omitted).
  * @returns Array of `CandidateCommit` objects, oldest-first.
  */
 export function listCandidateCommits(
   cwd: string,
   upstreamRef: string,
   forkRef: string,
+  prNumberMatching?: PrNumberMatchingOptions,
 ): CandidateCommit[] {
   // `git cherry -v <fork> <upstream>` lists commits reachable from <upstream>
   // but not equivalent in <fork>.  The `-v` flag adds the subject line.
@@ -198,6 +260,28 @@ export function listCandidateCommits(
       // Ignore — missing body log is non-fatal; subject matching still works.
     }
 
+    // Signal 4 (optional): PR-number match with subject-similarity guard.
+    // Build an index of PR numbers → fork subjects that reference them.
+    // Only populated when prNumberMatching?.enabled is true.
+    const forkPrIndex = new Map<number, string[]>()
+    if (prNumberMatching?.enabled) {
+      try {
+        const subjectLog = git(["log", forkRef, "--format=%s", `--max-count=${FORK_LOG_DEPTH}`], cwd)
+        for (const subj of subjectLog.split("\n")) {
+          const trimmed = subj.trim()
+          if (!trimmed) continue
+          for (const m of trimmed.matchAll(/#(\d+)/g)) {
+            const num = parseInt(m[1], 10)
+            const bucket = forkPrIndex.get(num)
+            if (bucket) bucket.push(trimmed)
+            else forkPrIndex.set(num, [trimmed])
+          }
+        }
+      } catch {
+        // Non-fatal — fall back to the other three signals.
+      }
+    }
+
     return rawCandidates.map((c) => {
       if (c.alreadyApplied) return c
 
@@ -210,13 +294,29 @@ export function listCandidateCommits(
       const upSha = c.sha.toLowerCase()
       for (const ref of forkShaRefs) {
         if (upSha.startsWith(ref) || ref.startsWith(upSha)) {
-        return { ...c, alreadyApplied: true }
+          return { ...c, alreadyApplied: true }
+        }
       }
-    }
 
-    return c
-  })
-}
+      // Signal 4: PR number present in both subjects, similarity above threshold.
+      if (prNumberMatching?.enabled) {
+        const upPrMatch = c.subject.match(/#(\d+)/)
+        if (upPrMatch) {
+          const prNum = parseInt(upPrMatch[1], 10)
+          const forkMatches = forkPrIndex.get(prNum)
+          if (
+            forkMatches?.some(
+              (s) => subjectSimilarity(c.subject, s) >= prNumberMatching.minSubjectSimilarity,
+            )
+          ) {
+            return { ...c, alreadyApplied: true }
+          }
+        }
+      }
+
+      return c
+    })
+  }
 
 /**
  * Returns the list of file paths changed by a single commit, with status prefixes
