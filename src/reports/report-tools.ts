@@ -178,6 +178,9 @@ produce a single Mermaid flowchart (flowchart TD) that visually represents: \
 (3) which AI tools were invoked (analyze_commit_for_backport, check_customization_compatibility, resolve_conflict_with_ai), \
 (4) the final disposition of each commit (applied ✅, blocked ⛔, needs-review ⚠️, skipped ⟳). \
 Use colour-coded styles: applied=green, blocked=red, needs-review=orange, skipped=grey. \
+\
+IMPORTANT: Always wrap node labels containing parentheses, brackets, or other special Mermaid characters in double quotes. \
+For example: "commit123(feat: add feature)" instead of commit123(feat: add feature). \
 Output ONLY the raw Mermaid code, no prose, no code fence.`
 
   const userPrompt = `Agent run summary:\n\n${runSummary}\n\nOutput the Mermaid flowchart now.`
