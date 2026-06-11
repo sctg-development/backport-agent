@@ -66,7 +66,7 @@ function matchesResolvePattern(filePath: string, patterns: string[]): boolean {
       }
     } else {
       // Glob pattern via minimatch.
-      if (minimatch(filePath, pattern, { matchBase: true })) return true
+      if (minimatch(filePath, pattern, { matchBase: true, nocase: true })) return true
     }
   }
   return false
@@ -133,8 +133,31 @@ export function makeGitTools(config: SyncConfig) {
         `${fork.remote}/${fork.branch}`,
         sync.prNumberMatching.enabled ? sync.prNumberMatching : undefined,
       )
-      // Filter out already-applied commits and cap to the configured run limit.
-      const pending = candidates.filter((c) => !c.alreadyApplied).slice(0, sync.maxCommitsPerRun)
+
+      // Compile skipCommits patterns once.  Each string is treated as a
+      // case-insensitive regular expression matched against the commit subject.
+      const skipPatterns = (sync.skipCommits ?? []).map((p) => {
+        try {
+          return new RegExp(p, "i")
+        } catch {
+          process.stderr.write(`[list_candidate_commits] Warning: invalid skipCommits pattern "${p}" — ignored\n`)
+          return null
+        }
+      }).filter(Boolean) as RegExp[]
+
+      // Filter out already-applied and explicitly skipped commits, then cap to the
+      // configured run limit.
+      const pending = candidates.filter((c) => {
+        if (c.alreadyApplied) return false
+        const skipped = skipPatterns.some((re) => re.test(c.subject))
+        if (skipped) {
+          process.stderr.write(
+            `[list_candidate_commits] Skipping ${c.sha.slice(0, 8)} (matches skipCommits): ${c.subject}\n`,
+          )
+        }
+        return !skipped
+      }).slice(0, sync.maxCommitsPerRun)
+
       return { candidates: pending, total: pending.length }
     },
   })
@@ -185,8 +208,8 @@ export function makeGitTools(config: SyncConfig) {
       // and the current UTC time (HHMM) to avoid collisions when the agent runs
       // more than once in the same calendar day.
       const now = new Date()
-      const date = now.toISOString().slice(0, 10)           // "YYYY-MM-DD"
-      const time = now.toISOString().slice(11, 16).replace(":", "")  // "HHMM"
+      const date = now.toISOString().slice(0, 10)             // "YYYY-MM-DD"
+      const time = now.toISOString().slice(11, 19).replace(/:/g, "")  // "HHMMSS"
       const branchName = `${sync.branchPrefix}${upstream.branch}-${date}-${time}`
       createSyncBranch(workingDir, branchName, `${fork.remote}/${fork.branch}`)
       return { branchName }

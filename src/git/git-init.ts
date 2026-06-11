@@ -153,7 +153,22 @@ export function ensureWorkingDir(config: SyncConfig): boolean {
       fetched = true
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
-      process.stderr.write(`[GitInit] Warning: fetch failed: ${msg}\n`)
+      // Auth failures, missing repos, and permission errors are not recoverable.
+      // Running with stale refs after such errors would silently misclassify commits
+      // (e.g. mark upstream commits as "already applied" when they haven't been fetched).
+      const isFatal = /permission denied|authentication failed|repository not found|could not read username|invalid username|remote: invalid|remote: error|not authorized|bad credentials|403|401/i.test(msg)
+      if (isFatal) {
+        throw new Error(
+          `[GitInit] Fatal fetch error — aborting run to prevent processing stale refs: ${msg}`,
+        )
+      }
+      // Transient network errors: log a highly-visible warning and continue.
+      // The agent will detect already-applied commits from local history, but new
+      // upstream commits may be missed if the fetch was needed to discover them.
+      process.stderr.write(`[GitInit] Warning: fetch failed (may be transient): ${msg}\n`)
+      process.stderr.write(
+        `[GitInit] WARNING: Running with potentially stale remote refs — candidate commit detection may be inaccurate.\n`,
+      )
       fetched = false
     }
   }

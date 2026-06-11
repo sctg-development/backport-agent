@@ -56,15 +56,14 @@ export type CandidateCommit = {
  * the upstream branch and the fork branch.
  *
  * Many CI environments start with a shallow clone (`--depth=1`).  This function
- * progressively deepens the clone in steps rather than fetching the entire
- * history at once, which keeps network usage low for the common case.
+ * progressively deepens the clone using exponential doubling, which requires fewer
+ * network round-trips than the previous fixed ladder while also avoiding the
+ * systematic overfetch that occurred when the merge-base fell just above a step.
  *
  * Algorithm:
- *  1. Try `git merge-base` at the current depth.
- *  2. If it fails, deepen to the next target depth by fetching only the *delta*
- *     (`--deepen=<delta>`) so that each fetch step adds the minimum required
- *     commits.  Tracking the delta avoids cumulative overfetching that would
- *     occur when passing the absolute target depth directly to `--deepen`.
+ *  1. Try `git merge-base` at the current history depth.
+ *  2. If it fails, double the fetch depth and retry.  Only the *delta* is passed to
+ *     `--deepen` so that each round adds the minimum required commits.
  *  3. If even `maxDepth` is insufficient, fall back to `--unshallow`.
  *
  * @param cwd         - Absolute path to the repository working directory.
@@ -81,32 +80,40 @@ export function ensureMergeBase(
   forkRef: string,
   maxDepth = 4000,
 ): string {
-  // Progressive depth ladder: target depths to try in order.
-  // We track the previously-fetched depth and pass only the *increment* to
-  // --deepen so that each fetch adds exactly the commits needed rather than
-  // refetching already-present history.
-  const targetDepths = [200, 500, 1000, 2000, maxDepth]
-  let currentDepth = 0
-
-  for (const targetDepth of targetDepths) {
-    try {
-      // Attempt to find the common ancestor at the current history depth.
-      return git(["merge-base", upstreamRef, forkRef], cwd)
-    } catch {
-      if (targetDepth === maxDepth) {
-        // Last resort: fetch the entire history and try once more.
-        git(["fetch", "--unshallow"], cwd)
-        return git(["merge-base", upstreamRef, forkRef], cwd)
-      }
-      // Deepen by the delta to reach `targetDepth` without redundant refetching.
-      const delta = targetDepth - currentDepth
-      git(["fetch", `--deepen=${delta}`], cwd)
-      currentDepth = targetDepth
-    }
+  // Try at the current (potentially already-deep) history first — zero-cost if the
+  // clone already has enough history.
+  try {
+    return git(["merge-base", upstreamRef, forkRef], cwd)
+  } catch {
+    // Need to deepen; fall through to the exponential doubling loop.
   }
 
-  // Unreachable: the last iteration always returns or throws via --unshallow.
-  throw new Error("Could not find merge-base even after full fetch")
+  // Exponential doubling: start at 200, double each round, stop at maxDepth.
+  // Tracks the depth already fetched so --deepen receives only the increment,
+  // avoiding redundant refetching of already-present commits.
+  let currentDepth = 0
+  let targetDepth = 200
+
+  while (targetDepth <= maxDepth) {
+    const delta = targetDepth - currentDepth
+    git(["fetch", `--deepen=${delta}`], cwd)
+    currentDepth = targetDepth
+
+    try {
+      return git(["merge-base", upstreamRef, forkRef], cwd)
+    } catch {
+      // Not deep enough yet; double and retry.
+    }
+
+    targetDepth = Math.min(targetDepth * 2, maxDepth)
+
+    // Once we have already fetched to maxDepth and still failed, break to unshallow.
+    if (currentDepth >= maxDepth) break
+  }
+
+  // Last resort: fetch the entire history and try once more.
+  git(["fetch", "--unshallow"], cwd)
+  return git(["merge-base", upstreamRef, forkRef], cwd)
 }
 
 /**

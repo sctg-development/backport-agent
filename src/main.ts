@@ -190,15 +190,22 @@ Produce a draft pull request with a clear report. Never push directly to the mai
         * \`forcedStrategy: "ours"\`   → use \`forkVersion\` directly as resolvedContent; call apply_resolved_file immediately. No AI call needed.
         * \`forcedStrategy: "theirs"\` → use \`upstreamVersion\` directly as resolvedContent; call apply_resolved_file immediately. No AI call needed.
         * \`forcedStrategy: null\`     → proceed with AI resolution below.
-      - (When forcedStrategy is null) Call resolve_conflict_with_ai with the base/ours/theirs content to get an AI-proposed resolution.
+      - (When forcedStrategy is null) Call resolve_conflict_with_ai with the base/ours/theirs content.
+        * If classify_commit_risk returned non-empty customizationIds for this commit, pass them as
+          \`affectedCustomizationIds\` so the model knows which fork invariants to preserve.
       - If confidence is "high" or "medium": verify no conflict markers remain, then call apply_resolved_file, then continue_cherry_pick.
       - If confidence is "low" or the tool returned an error: call abort_cherry_pick, mark commit as conflict-blocked.
 6. Call run_validation with the highest risk level encountered in this run.
+   - If classify_commit_risk returned non-empty \`testCommands\` for any commit in this run, pass them
+     as \`extraCommands\` to run_validation so customization-specific tests are included in the suite.
 7. If validation fails: note it in the report, mark relevant commits as validation-failed.
 8. Call push_sync_branch (unless dry-run).
 9. Call find_existing_sync_pr to check for an existing PR.
 10. Call generate_report with the full summary of all decisions.
 11. Call create_sync_pr with the report as body (unless an existing PR was found and up to date).
+12. If the task context line says "Auto-merge on success: enabled" AND all commits in this run were
+    applied or skipped (none are conflict-blocked or validation-failed) AND run_validation returned
+    allPassed:true, call auto_merge_pr(prNumber) with the PR number from step 11.
 
 ## Accountability (enforced — never skip)
 - You received a finite list of SHAs from list_candidate_commits.
@@ -314,7 +321,7 @@ async function main() {
 
   const resolvedApiKey = resolveApiKey(config)
   const reportTool = makeReportTool(config, promptLogPath, config.models.provider, resolvedApiKey) // 1 terminal tool (completesRun: true)
-  const aiTools = makeAiTools(config, promptLogPath, config.models.provider, resolvedApiKey) // 3 AI-powered analysis tools
+  const aiTools = makeAiTools(config, promptLogPath, config.models.provider, resolvedApiKey, customizations) // 4 AI-powered analysis tools
 
   // --- SDK built-in tools ---
   // Add Cline integrated tools so the agent can also perform generic workspace
@@ -499,11 +506,16 @@ async function main() {
 
   // --- Task construction ---
   const dryRunNote = config.sync.dryRun ? " [DRY RUN — no changes will be pushed]" : ""
+  const autoMergeNote = config.sync.autoMergeOnSuccess
+    ? `Auto-merge on success: enabled (method: ${config.sync.autoMergeMethod})\n`
+    : ""
+
   const task =
     `Synchronize the fork \`${config.fork.repo}@${config.fork.branch}\` with upstream ` +
     `\`${config.upstream.repo}@${config.upstream.branch}\`.${dryRunNote}\n\n` +
     `Working directory: ${config.workingDir}\n` +
-    `Max commits per run: ${config.sync.maxCommitsPerRun}`
+    `Max commits per run: ${config.sync.maxCommitsPerRun}\n` +
+    autoMergeNote
 
   console.error(`\n=== Backport Agent starting${dryRunNote} ===\n`)
 

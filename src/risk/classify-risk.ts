@@ -45,6 +45,13 @@ export type CommitRisk = {
   touchesCustomization: boolean
   /** IDs of `CustomizationEntry` objects whose paths were matched by this commit. */
   customizationIds: string[]
+  /**
+   * Union of `testCommands` from all `CustomizationEntry` objects matched by this
+   * commit.  The agent should pass these as `extraCommands` to `run_validation`
+   * when validating a high-risk commit that touches customization zones.
+   * Empty array when no customization defines `testCommands` or when risk is low/medium.
+   */
+  testCommands: string[]
 }
 
 /**
@@ -121,6 +128,7 @@ const MEDIUM_RISK_PATTERNS = [
 export function classifyRisk(sha: string, changedFiles: string[], customizations: Customizations): CommitRisk {
   const reasons: string[] = []
   const matchedCustomizationIds: string[] = []
+  const matchedTestCommands: string[] = []
   let level: RiskLevel = "low"
 
   // --- Step 1: Check fork customization zones ---
@@ -136,6 +144,10 @@ export function classifyRisk(sha: string, changedFiles: string[], customizations
       matchedCustomizationIds.push(entry.id)
       reasons.push(`Touches customization "${entry.id}": ${hits.join(", ")}`)
       level = "high"
+      // Collect per-customization test commands for later injection into run_validation.
+      if (entry.testCommands) {
+        matchedTestCommands.push(...entry.testCommands)
+      }
     }
   }
 
@@ -185,5 +197,7 @@ export function classifyRisk(sha: string, changedFiles: string[], customizations
     reasons,
     touchesCustomization: matchedCustomizationIds.length > 0,
     customizationIds: matchedCustomizationIds,
+    // Deduplicate in case the same command appears in multiple customization entries.
+    testCommands: [...new Set(matchedTestCommands)],
   }
 }

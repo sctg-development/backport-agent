@@ -187,6 +187,53 @@ export const SyncConfigSchema = z.object({
           minSubjectSimilarity: z.number().min(0).max(1).default(0.4),
         })
         .default(() => ({ enabled: false, minSubjectSimilarity: 0.4 })),
+
+      /**
+       * Glob and regex patterns matched against commit subjects.  Any upstream
+       * commit whose subject matches at least one pattern is silently excluded from
+       * the candidate list without being processed.
+       *
+       * Patterns are tested as JavaScript regular expressions (case-insensitive).
+       * Examples:
+       *  - `"^docs:"` — skip all commits that start with "docs:"
+       *  - `"^chore: release"` — skip automated release commits
+       *  - `"^revert "` — skip revert commits (they are often re-applied later)
+       *
+       * Defaults to `[]` (nothing skipped).
+       */
+      skipCommits: z
+        .array(z.string())
+        .default([])
+        .describe("Regex patterns (case-insensitive) matched against commit subjects — matching commits are excluded"),
+
+      /**
+       * When `true`, the agent merges the sync PR via the GitHub API after
+       * `run_validation` passes and no commit-blocked errors remain.
+       * Requires `GITHUB_TOKEN` with `pull_requests: write` permission.
+       * Defaults to `false`.
+       */
+      autoMergeOnSuccess: z
+        .boolean()
+        .default(false)
+        .describe("Auto-merge the sync PR when all commits were applied and validation passed"),
+
+      /**
+       * GitHub merge strategy to use when `autoMergeOnSuccess` is enabled.
+       * Defaults to `"squash"`.
+       */
+      autoMergeMethod: z
+        .enum(["squash", "merge", "rebase"])
+        .default("squash")
+        .describe("GitHub merge method for auto-merge: squash | merge | rebase"),
+
+      /**
+       * When `true`, the sync branch is deleted via the GitHub API after a
+       * successful auto-merge.  Defaults to `true`.
+       */
+      autoMergeDeleteBranch: z
+        .boolean()
+        .default(true)
+        .describe("Delete the sync branch after a successful auto-merge"),
     })
     // Allow omitting the entire sync block in config.json; each field has its own default.
     .default(() => ({} as any)),
@@ -330,6 +377,37 @@ export const SyncConfigSchema = z.object({
         .boolean()
         .default(true)
         .describe("Include actual file content snippets in check_customization_compatibility prompts"),
+
+      /**
+       * Controls how `reconcile_ai_assessments` merges the outputs of
+       * `analyze_commit_for_backport` and `check_customization_compatibility`.
+       *
+       * - `"conservative"` (default): always take the more restrictive recommendation.
+       *   Safe but may over-escalate when one model is systematically cautious.
+       * - `"optimistic"`: always take the more permissive recommendation.
+       *   Faster throughput; only appropriate when false-positive escalations are a
+       *   larger problem than missed conflicts.
+       * - `"weighted"`: weighted blend of the two severity scores (see `analyzeWeight`).
+       *   Balances the two models; requires tuning.
+       */
+      reconciliationMode: z
+        .enum(["conservative", "optimistic", "weighted"])
+        .default("conservative")
+        .describe("How to reconcile analyze vs. compatibility recommendations: conservative | optimistic | weighted"),
+
+      /**
+       * Weight given to `analyze_commit_for_backport`'s severity score in weighted
+       * reconciliation mode.  Must be in the range [0, 1].
+       * The compatibility check receives weight `1 - analyzeWeight`.
+       * Only used when `reconciliationMode` is `"weighted"`.
+       * Defaults to `0.5` (equal weight).
+       */
+      analyzeWeight: z
+        .number()
+        .min(0)
+        .max(1)
+        .default(0.5)
+        .describe("Weight for analyze_commit severity in weighted mode (0=full compat weight, 1=full analyze weight)"),
     })
     .default(() => ({} as any)),
 

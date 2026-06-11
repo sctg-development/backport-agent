@@ -235,5 +235,66 @@ export function makeGitHubTools(config: SyncConfig) {
     },
   })
 
-  return [findExistingPrTool, createSyncPrTool, addHumanReviewCommentTool]
+  /**
+   * Tool: auto_merge_pr
+   *
+   * Merges an open PR via the GitHub REST API using the configured merge method.
+   * Only callable when `config.sync.autoMergeOnSuccess` is `true`.
+   *
+   * After a successful merge, optionally deletes the head branch if
+   * `config.sync.autoMergeDeleteBranch` is `true`.
+   *
+   * The agent MUST only call this tool when:
+   *  1. All candidate commits were applied or skipped (none are conflict-blocked or
+   *     validation-failed).
+   *  2. `run_validation` returned `allPassed: true`.
+   *  3. The task context line says "Auto-merge on success: enabled".
+   */
+  const autoMergePrTool = defineTool({
+    name: "auto_merge_pr",
+    description:
+      "Merge the sync PR via the GitHub API after all commits were successfully applied and validation passed. " +
+      "Only call this when the task context says 'Auto-merge on success: enabled' and run_validation returned allPassed:true. " +
+      "Uses the merge method from config (squash | merge | rebase). " +
+      "Optionally deletes the head branch after merge.",
+    inputSchema: z.object({
+      /** PR number returned by `create_sync_pr`. */
+      prNumber: z.number().int().describe("PR number to merge"),
+    }),
+    execute: async ({ prNumber }) => {
+      if (sync.dryRun) return { merged: false, dryRun: true }
+      if (!sync.autoMergeOnSuccess) {
+        return { merged: false, disabled: true, reason: "autoMergeOnSuccess is not enabled in config" }
+      }
+
+      const octokit = makeOctokit()
+      const { owner, repo } = parseRepo(fork.repo)
+
+      // Fetch PR head branch name before merging (needed for deletion).
+      const { data: pr } = await octokit.pulls.get({ owner, repo, pull_number: prNumber })
+      const headBranch = pr.head.ref
+
+      const { data: mergeResult } = await octokit.pulls.merge({
+        owner,
+        repo,
+        pull_number: prNumber,
+        merge_method: sync.autoMergeMethod,
+      })
+
+      let branchDeleted = false
+      if (sync.autoMergeDeleteBranch) {
+        try {
+          await octokit.git.deleteRef({ owner, repo, ref: `heads/${headBranch}` })
+          branchDeleted = true
+        } catch {
+          // Non-fatal — the branch may already be protected or the token may lack
+          // the delete-branch permission.
+        }
+      }
+
+      return { merged: true, sha: mergeResult.sha, branchDeleted }
+    },
+  })
+
+  return [findExistingPrTool, createSyncPrTool, addHumanReviewCommentTool, autoMergePrTool]
 }

@@ -54,6 +54,8 @@ export const ALLOWED_COMMAND_PREFIXES = [
   "npm run ",
   "pnpm run ",
   "yarn run ",
+  "bun run ",
+  "bun install",
   "npx tsc",
   "npx eslint",
   "npx vitest",

@@ -45,6 +45,7 @@ import { z } from "zod"
 import { Agent } from "@sctg/cline-sdk"
 import { defineTool } from "../tool-helper.js"
 import type { SyncConfig } from "../config/schema.js"
+import type { Customizations } from "../customizations/schema.js"
 import { globSync } from "node:fs"
 import { join as joinPath } from "node:path"
 import { minimatch } from "minimatch"
@@ -390,13 +391,18 @@ export function detectHallucinatedFileRefs(
   textFragments: string[],
   actualChangedFiles: string[],
 ): string[] {
+  // Match file-path-like references including:
+  //  - Root-level files with no slash: README.md, config.ts
+  //  - Scoped packages: @scope/pkg/file.ts
+  //  - Hyphenated paths: cline-sdk/src/index.ts
+  // The original \b boundary is removed as it breaks on hyphens and @ prefixes.
   const FILE_REF_RE =
-    /\b(?:[\w.-]+\/)+[\w.-]+\.(?:ts|tsx|js|jsx|mts|cts|mjs|cjs|json|md|yaml|yml|py|go|rs|java|kt|cs|cpp|c|h|rb|php|swift|sh)\b/g
+    /(@?(?:[\w.@-][\w.@/-]*\/)*[\w.@-][\w.@-]*\.(?:ts|tsx|js|jsx|mts|cts|mjs|cjs|json|md|yaml|yml|py|go|rs|java|kt|cs|cpp|c|h|rb|php|swift|sh))/g
 
   const mentioned = new Set<string>()
   for (const text of textFragments) {
     for (const match of text.matchAll(FILE_REF_RE)) {
-      mentioned.add(match[0])
+      mentioned.add(match[1] ?? match[0])
     }
   }
 
@@ -439,14 +445,22 @@ function makeSubAgent(
 /**
  * Builds and returns all AI-powered agent tools pre-bound to the provided config.
  *
- * @param config      - Validated `SyncConfig` loaded from `config.json`.
- * @param logPath     - Absolute path to the JSONL prompt log file for this run.
- *                      Created by `main.ts` as `run-<timestamp>.prompts.jsonl`.
- * @param providerId  - LLM provider ID resolved from `config.models.provider`.
- * @param apiKey      - Resolved API key (from config or env); `undefined` for SDK auto-discovery.
- * @returns Array of three agent tools for AI-assisted analysis.
+ * @param config          - Validated `SyncConfig` loaded from `config.json`.
+ * @param logPath         - Absolute path to the JSONL prompt log file for this run.
+ *                          Created by `main.ts` as `run-<timestamp>.prompts.jsonl`.
+ * @param providerId      - LLM provider ID resolved from `config.models.provider`.
+ * @param apiKey          - Resolved API key (from config or env); `undefined` for SDK auto-discovery.
+ * @param customizations  - Loaded customizations manifest; used to enrich conflict resolution
+ *                          prompts with fork-specific context when the caller provides IDs.
+ * @returns Array of four agent tools for AI-assisted analysis.
  */
-export function makeAiTools(config: SyncConfig, logPath: string, providerId: string, apiKey: string | undefined) {
+export function makeAiTools(
+  config: SyncConfig,
+  logPath: string,
+  providerId: string,
+  apiKey: string | undefined,
+  customizations?: Customizations,
+) {
   // -------------------------------------------------------------------------
   // Tool 1: resolve_conflict_with_ai
   // -------------------------------------------------------------------------
@@ -507,13 +521,26 @@ export function makeAiTools(config: SyncConfig, logPath: string, providerId: str
        * Optional: a human-readable note describing relevant fork customisations
        * in this file (e.g. "This file contains the keypoollive provider registration").
        * When provided, the model uses it to decide which parts must not be overwritten.
+       * If omitted but `affectedCustomizationIds` is supplied, the note is built
+       * automatically from the customizations manifest.
        */
       customizationNote: z
         .string()
         .optional()
         .describe("Optional description of fork customisations in this file to help preserve them"),
+
+      /**
+       * IDs of `CustomizationEntry` objects (from `classify_commit_risk.customizationIds`)
+       * that overlap with the file being resolved.  When provided and no explicit
+       * `customizationNote` is given, the descriptions and invariants of these
+       * entries are injected into the conflict resolution prompt automatically.
+       */
+      affectedCustomizationIds: z
+        .array(z.string())
+        .optional()
+        .describe("Customization IDs from classify_commit_risk that overlap with this file"),
     }),
-    execute: async ({ filePath, baseContent, ourContent, theirContent, commitMessage, customizationNote }) => {
+    execute: async ({ filePath, baseContent, ourContent, theirContent, commitMessage, customizationNote, affectedCustomizationIds }) => {
       /**
        * System prompt focuses the sub-agent exclusively on conflict resolution.
        * The model must output only a single JSON object.
@@ -539,8 +566,27 @@ export function makeAiTools(config: SyncConfig, logPath: string, providerId: str
         "4. When in doubt, prefer preserving fork customisations and mark confidence as 'low'.",
       ].join("\n")
 
-      const customizationSection = customizationNote
-        ? `\nFork customisation context:\n${customizationNote}\n`
+      // Build the customization context section:
+      // 1. Use the explicitly provided note if present.
+      // 2. Otherwise auto-build from affectedCustomizationIds + loaded manifest.
+      let resolvedCustomizationNote = customizationNote
+      if (!resolvedCustomizationNote && affectedCustomizationIds?.length && customizations) {
+        const entries = customizations.customizations.filter((c) =>
+          affectedCustomizationIds.includes(c.id),
+        )
+        if (entries.length > 0) {
+          resolvedCustomizationNote = entries
+            .map((c) => {
+              const invariantLine =
+                c.invariants.length > 0 ? `\n  Invariants: ${c.invariants.join("; ")}` : ""
+              return `• ${c.id}: ${c.description}${invariantLine}`
+            })
+            .join("\n")
+        }
+      }
+
+      const customizationSection = resolvedCustomizationNote
+        ? `\nFork customisation context:\n${resolvedCustomizationNote}\n`
         : ""
 
       const userPrompt =
@@ -562,7 +608,14 @@ export function makeAiTools(config: SyncConfig, logPath: string, providerId: str
       const CONFLICT_MARKER_RE = /^(<{7}|={7}|>{7})/m
 
       let lastError: string | null = null
-      for (const { modelId, label } of modelsToTry) {
+      for (const [idx, { modelId, label }] of modelsToTry.entries()) {
+        // Brief pause before fallback attempts: if the first model failed due to a
+        // rate-limit or transient error, hitting the second model immediately may
+        // encounter the same condition.  A 2-second delay costs little latency but
+        // substantially improves success rates under provider rate-pressure.
+        if (idx > 0 && lastError !== null) {
+          await new Promise((r) => setTimeout(r, 2_000))
+        }
         try {
           const subAgent = makeSubAgent(modelId, systemPrompt, providerId, apiKey)
           const t0 = Date.now()
@@ -784,11 +837,25 @@ export function makeAiTools(config: SyncConfig, logPath: string, providerId: str
       changedFiles: z.array(z.string()).describe("List of file paths changed by this commit"),
     }),
     execute: async ({ sha, commitMessage, diff, changedFiles }) => {
+      // Build the fork customization context block once per tool factory (static).
+      const forkContextLines: string[] =
+        customizations?.customizations.length
+          ? [
+              "This fork has the following customization zones (files in these zones are fork-specific):",
+              ...customizations.customizations.map(
+                (c) => `  - ${c.id}: ${c.description} (paths: ${c.paths.join(", ")})`,
+              ),
+              "If this commit modifies files that fall inside these zones, flag it as high-risk.",
+              "",
+            ]
+          : []
+
       const systemPrompt = [
         "You are an expert software engineer specialising in Git history analysis.",
         "Your task is to analyse a single upstream commit and assess how complex it is to",
         "backport it into a heavily customised fork.",
         "",
+        ...forkContextLines,
         "Output ONLY a valid JSON object with exactly these fields:",
         '  "summary":             string  — 2-3 sentence description of what this commit does.',
         '  "keyChanges":          string[] — bullet-point list of the most important code changes.',
@@ -1175,7 +1242,22 @@ export function makeAiTools(config: SyncConfig, logPath: string, providerId: str
       const analyzeSev = SEVERITY[analyzeRecommendation] ?? 2
       // If check_compatibility says not compatible, treat as at-least "review-required".
       const compatSev = compatibilityCompatible ? 0 : 2
-      let finalSev = Math.max(analyzeSev, compatSev)
+
+      // Merge the two severity scores according to config.ai.reconciliationMode.
+      let finalSev: number
+      const mode = config.ai.reconciliationMode ?? "conservative"
+      if (mode === "conservative") {
+        // Default: always take the more restrictive recommendation.
+        finalSev = Math.max(analyzeSev, compatSev)
+      } else if (mode === "optimistic") {
+        // Take the more permissive recommendation (faster throughput, less safe).
+        finalSev = Math.min(analyzeSev, compatSev)
+      } else {
+        // Weighted blend: round the weighted average to the nearest severity level.
+        const w = config.ai.analyzeWeight ?? 0.5
+        finalSev = Math.round(w * analyzeSev + (1 - w) * compatSev)
+        finalSev = Math.max(0, Math.min(3, finalSev))
+      }
 
       // Apply config.ai.requireReviewOnSemanticRisk (Improvement 10).
       if (config.ai.requireReviewOnSemanticRisk && analyzeSemanticRiskFactors.length > 0) {
