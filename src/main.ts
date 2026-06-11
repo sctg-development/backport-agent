@@ -448,6 +448,7 @@ async function main() {
   // Because agent state is persisted on disk (git), restarting the run is safe —
   // the agent will detect already-applied commits from the git log.
   const RETRIABLE_RE = /503|rate.?limit|too many requests|overloaded|service.?unavailable|high.?demand|try again later|temporarily unavailable|exceeded your current quota|quota.*exceeded|check your plan|billing details/i
+  const TIMEOUT_RE = /timeout|timed out|body timeout|request timeout|socket timeout|ETIMEDOUT|ESOCKETTIMEDOUT|ECONNABORTED|deadline exceeded|response timeout|read timeout|connect timeout/i
   const BASE_DELAY_MS = 15_000
   const MAX_ATTEMPTS = 5
 
@@ -459,10 +460,11 @@ async function main() {
         result = await agent.run(task)
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err)
-        if (attempt < MAX_ATTEMPTS && RETRIABLE_RE.test(msg)) {
+        if (attempt < MAX_ATTEMPTS && (RETRIABLE_RE.test(msg) || TIMEOUT_RE.test(msg))) {
           const delay = BASE_DELAY_MS * attempt
+          const errorType = TIMEOUT_RE.test(msg) ? "Timeout" : "Provider"
           process.stderr.write(
-            `[Retry] Provider error on attempt ${attempt}/${MAX_ATTEMPTS}: ${msg.slice(0, 120)}\n` +
+            `[Retry] ${errorType} error on attempt ${attempt}/${MAX_ATTEMPTS}: ${msg.slice(0, 120)}\n` +
               `[Retry] Waiting ${delay / 1000}s before retrying...\n`,
           )
           iterationOffset += lastSeenIteration
@@ -479,10 +481,11 @@ async function main() {
       if (result.status !== "completed") {
         const err = result.error ?? new Error(`Agent run ended with status "${result.status}" (model API error?)`)
         const msg = err.message
-        if (attempt < MAX_ATTEMPTS && RETRIABLE_RE.test(msg)) {
+        if (attempt < MAX_ATTEMPTS && (RETRIABLE_RE.test(msg) || TIMEOUT_RE.test(msg))) {
           const delay = BASE_DELAY_MS * attempt
+          const errorType = TIMEOUT_RE.test(msg) ? "Timeout" : "Provider"
           process.stderr.write(
-            `[Retry] Silent provider error (status=${result.status}) on attempt ${attempt}/${MAX_ATTEMPTS}: ${msg.slice(0, 120)}\n` +
+            `[Retry] ${errorType} error (status=${result.status}) on attempt ${attempt}/${MAX_ATTEMPTS}: ${msg.slice(0, 120)}\n` +
               `[Retry] Waiting ${delay / 1000}s before retrying...\n`,
           )
           iterationOffset += lastSeenIteration
@@ -507,7 +510,23 @@ async function main() {
     console.error(`\n=== Run complete ===\n`)
     if (result.outputText) {
       // The generate_report tool completes the run; outputText is the Markdown summary.
-      console.log(result.outputText)
+      const verbose = process.env.VERBOSE === "true"
+      if (verbose) {
+        // In verbose mode, display only the markdown report
+        const parsedReport = JSON.parse(result.outputText)
+        console.log(parsedReport.report)
+
+        // Shows a one line command for merging the new branch in the terminal, if the report contains a new branch to merge.
+        const commandLine = `# Sample merge command:
+  pushd ${config.workingDir}
+     git checkout ${config.fork.branch}
+     git merge ${upstreamRef}
+     git push
+  popd`
+        console.log(commandLine)
+      } else {
+        console.log(result.outputText)
+      }
     } else {
       // With requireCompletionTool: true this should never happen on a clean run.
       throw new Error("Agent run completed but generate_report was never called (empty output). Check the prompt log for details.")
