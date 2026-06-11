@@ -372,6 +372,71 @@ async function main() {
   // Flatten all tools into a single array for the Agent constructor.
   const allTools = [...builtinTools, ...gitTools, riskTool, validationTool, ...githubTools, reportTool, ...aiTools]
 
+  const verbose = process.env.VERBOSE === "true"
+
+  // --- Keypool event handler (keypoollive provider only) ---
+  // Provides real-time visibility into key selection, rotation, and token usage.
+  // Accumulated statistics are printed as a summary at the end of the run.
+  const keypoolStats = {
+    totalInputTokens: 0,
+    totalOutputTokens: 0,
+    totalCacheReadTokens: 0,
+    totalCacheWriteTokens: 0,
+    rotations: 0,
+    exhaustions: 0,
+    keysUsed: new Set<string>(),
+  }
+
+  // Infer KeypoolEvent type from Agent constructor to avoid a direct import from @sctg/cline-shared.
+  type AgentKeypoolEvent = NonNullable<Parameters<typeof Agent>[0]> extends { keypoolEventHandler?: (e: infer E) => void } ? E : never
+
+  function handleKeypoolEvent(event: AgentKeypoolEvent): void {
+    switch (event.type) {
+      case "key-selected":
+        process.stderr.write(
+          `[Keypool] Key selected: ${event.keyHint}` +
+          (event.keyOwner ? ` (${event.keyOwner})` : "") +
+          ` — ${event.providerName}/${event.modelId}\n`,
+        )
+        keypoolStats.keysUsed.add(event.keyHint)
+        break
+      case "key-rotated":
+        keypoolStats.rotations++
+        process.stderr.write(
+          `[Keypool] Rotating from ${event.failedKeyHint}` +
+          ` (attempt ${event.attempt + 1}): ${event.error.slice(0, 120)}\n`,
+        )
+        break
+      case "key-exhausted":
+        keypoolStats.exhaustions++
+        process.stderr.write(
+          `[Keypool] All ${event.attempts} rotation attempts exhausted` +
+          ` for ${event.providerName}/${event.modelId}\n`,
+        )
+        break
+      case "key-recovered":
+        if (verbose) {
+          process.stderr.write(`[Keypool] Key healthy: ${event.keyHint}\n`)
+        }
+        break
+      case "usage-recorded":
+        keypoolStats.totalInputTokens += event.inputTokens
+        keypoolStats.totalOutputTokens += event.outputTokens
+        keypoolStats.totalCacheReadTokens += event.cacheReadTokens
+        keypoolStats.totalCacheWriteTokens += event.cacheWriteTokens
+        keypoolStats.keysUsed.add(event.keyHint)
+        if (verbose) {
+          process.stderr.write(
+            `[Keypool] Usage: in=${event.inputTokens} out=${event.outputTokens}` +
+            (event.cacheReadTokens ? ` cacheRead=${event.cacheReadTokens}` : "") +
+            ` via ${event.keyHint}` +
+            (event.keyOwner ? ` (${event.keyOwner})` : "") + "\n",
+          )
+        }
+        break
+    }
+  }
+
   // --- Agent instantiation ---
   // Provider and API key are read from config.models (provider + apiKey fields).
   // The apiKey is resolved from a literal value, a "$ENV_VAR" reference, or the
@@ -385,13 +450,14 @@ async function main() {
     maxIterations: config.sync.maxIterations,
     // Prevent the run from ending until generate_report (completesRun: true) is called.
     completionPolicy: { requireCompletionTool: true },
+    // Wire keypoollive event callbacks to get visibility into key rotation and usage.
+    ...(config.models.provider === "keypoollive" ? { keypoolEventHandler: handleKeypoolEvent } : {}),
   })
 
   // --- Event subscription ---
   // Stream assistant text deltas to stdout so the operator can watch progress.
   // Tool-level progress (iterations, tool calls) is gated behind VERBOSE=true to
   // keep non-verbose runs clean.  Set VERBOSE=true in .env or the shell to enable.
-  const verbose = process.env.VERBOSE === "true"
   let lastEventWasText = false
   // Track the highest iteration seen so far across all attempts, so that when
   // the agent is restarted after a provider error the displayed counter is
@@ -510,7 +576,6 @@ async function main() {
     console.error(`\n=== Run complete ===\n`)
     if (result.outputText) {
       // The generate_report tool completes the run; outputText is the Markdown summary.
-      const verbose = process.env.VERBOSE === "true"
       if (verbose) {
         // In verbose mode, display only the markdown report
         const parsedReport = JSON.parse(result.outputText)
@@ -533,6 +598,25 @@ async function main() {
     }
   } finally {
     userInstructionService.stop()
+
+    // Print keypoollive usage summary if any requests were made.
+    if (config.models.provider === "keypoollive" && (keypoolStats.totalInputTokens > 0 || keypoolStats.rotations > 0)) {
+      const cacheNote = keypoolStats.totalCacheReadTokens > 0
+        ? `, ${keypoolStats.totalCacheReadTokens.toLocaleString()} cache-read`
+        : ""
+      process.stderr.write(
+        `\n[Keypool] Run summary:` +
+        ` ${keypoolStats.totalInputTokens.toLocaleString()} input${cacheNote}` +
+        ` / ${keypoolStats.totalOutputTokens.toLocaleString()} output tokens,` +
+        ` ${keypoolStats.rotations} rotation(s),` +
+        ` ${keypoolStats.keysUsed.size} key(s) used\n`,
+      )
+      if (keypoolStats.exhaustions > 0) {
+        process.stderr.write(
+          `[Keypool] WARNING: ${keypoolStats.exhaustions} exhaustion event(s) — all keys were rate-limited simultaneously.\n`,
+        )
+      }
+    }
   }
 }
 
