@@ -98,22 +98,22 @@ All --provider/--api-key flags take precedence over values in config.json.
 // Load .env file if present — allows setting KEYPOOL_VAULT_URL, KEYPOOL_LIVE_SECRET,
 // BACKPORT_CUSTOMIZATIONS, etc. without modifying the shell environment.
 // Uses Node.js 20.6+ built-in --env-file support via the `dotenv` fallback.
-import { existsSync, mkdirSync } from "node:fs"
-import { resolve as resolvePath, join as joinPath } from "node:path"
-import { Agent, createBuiltinTools, createUserInstructionConfigService } from "@sctg/cline-sdk"
-import type { UserInstructionConfigRecord } from "@sctg/cline-sdk"
-import { loadConfig } from "./config/loader.js"
-import { loadCustomizations } from "./customizations/loader.js"
-import { makeGitTools } from "./git/git-tools.js"
-import { applyGitAuth, ensureWorkingDir } from "./git/git-init.js"
-import { ensureMergeBase, fetchRemotes, listCandidateCommits } from "./git/git-client.js"
-import { makeRiskTool } from "./risk/risk-tools.js"
-import { makeValidationTool } from "./validation/validation-tools.js"
-import { makeGitHubTools } from "./github/github-tools.js"
-import { makeReportTool } from "./reports/report-tools.js"
-import { buildNoopSyncReport } from "./reports/noop-report.js"
-import { makeAiTools } from "./ai/ai-tools.js"
-import type { SyncConfig } from "./config/schema.js"
+import { existsSync, mkdirSync } from "node:fs";
+import { resolve as resolvePath, join as joinPath } from "node:path";
+import { Agent, createBuiltinTools, createUserInstructionConfigService } from "@sctg/cline-sdk";
+import type { UserInstructionConfigRecord } from "@sctg/cline-sdk";
+import { loadConfig } from "./config/loader.js";
+import { loadCustomizations } from "./customizations/loader.js";
+import { makeGitTools } from "./git/git-tools.js";
+import { applyGitAuth, ensureWorkingDir } from "./git/git-init.js";
+import { ensureMergeBase, fetchRemotes, listCandidateCommits } from "./git/git-client.js";
+import { makeRiskTool } from "./risk/risk-tools.js";
+import { makeValidationTool } from "./validation/validation-tools.js";
+import { makeGitHubTools } from "./github/github-tools.js";
+import { makeReportTool } from "./reports/report-tools.js";
+import { buildNoopSyncReport } from "./reports/noop-report.js";
+import { makeAiTools } from "./ai/ai-tools.js";
+import type { SyncConfig } from "./config/schema.js";
 {
   const envPath = resolvePath(process.cwd(), ".env")
   if (existsSync(envPath)) {
@@ -562,6 +562,8 @@ async function main() {
         throw err
       }
 
+      // Reset currentAttempt after successful retry so subsequent iterations don't show incorrect retry suffix
+      currentAttempt = 1
       return result
     }
     throw new Error("unreachable")
