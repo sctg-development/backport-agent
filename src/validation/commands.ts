@@ -151,6 +151,11 @@ export function isAllowedCommand(command: string): boolean {
 export function runValidationCommand(command: string, cwd: string): CommandResult {
   // Security gate: reject any command not matching the allowlist.
   if (!isAllowedCommand(command)) {
+    // Log to stderr if verbose mode is enabled
+    if (process.env.VERBOSE === "true") {
+      process.stderr.write(`[VERBOSE] Command rejected by isAllowedCommand: "${command}"\n`)
+    }
+
     return {
       command,
       success: false,
