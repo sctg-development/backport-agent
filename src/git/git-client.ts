@@ -464,10 +464,14 @@ export function abortCherryPick(cwd: string): void {
  * @returns The file content as a UTF-8 string, or `null` if the file does not
  *          exist at the given ref (e.g. the file was added by the cherry-picked commit).
  */
-export function getFileAtRef(cwd: string, ref: string, filePath: string): string | null {
+export function getFileAtRef(cwd: string, ref: string, filePath: string, maxBytes?: number): string | null {
   try {
     // `git show <ref>:<path>` streams the blob content to stdout.
-    return git(["show", `${ref}:${filePath}`], cwd)
+    const content = git(["show", `${ref}:${filePath}`], cwd)
+    if (maxBytes && content.length > maxBytes) {
+      return content.slice(0, maxBytes) + "\n... [truncated]"
+    }
+    return content
   } catch {
     // Non-zero exit means the path does not exist at that ref.
     return null
