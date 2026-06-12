@@ -399,6 +399,11 @@ async function main() {
 
   function handleKeypoolEvent(event: AgentKeypoolEvent): void {
     switch (event.type) {
+      case "user-agent-set":
+        process.stderr.write(
+          `[Keypool] User-Agent: ${event.userAgent} (source: ${event.source})\n`,
+        )
+        break
       case "key-selected":
         process.stderr.write(
           `[Keypool] Key selected: ${event.keyHint}` +
@@ -466,10 +471,9 @@ async function main() {
   // Tool-level progress (iterations, tool calls) is gated behind VERBOSE=true to
   // keep non-verbose runs clean.  Set VERBOSE=true in .env or the shell to enable.
   let lastEventWasText = false
-  // Track the highest iteration seen so far across all attempts, so that when
-  // the agent is restarted after a provider error the displayed counter is
-  // continuous rather than resetting to 1.
-  let iterationOffset = 0
+  // Track iterations across retry attempts: when restarting after an error,
+  // display should show the max iteration seen before the retry (not cumulative).
+  let maxIterationFromPreviousRuns = 0
   let lastSeenIteration = 0
   let currentAttempt = 1
   agent.subscribe((event: Parameters<Parameters<typeof agent.subscribe>[0]>[0]) => {
@@ -477,7 +481,7 @@ async function main() {
     if (typeof rawIter === "number" && rawIter > lastSeenIteration) {
       lastSeenIteration = rawIter
     }
-    const displayIter = typeof rawIter === "number" ? iterationOffset + rawIter : "?"
+    const displayIter = typeof rawIter === "number" ? maxIterationFromPreviousRuns + rawIter : "?"
     if (event.type === "assistant-text-delta") {
       lastEventWasText = true
       process.stdout.write(event.text)
@@ -531,21 +535,25 @@ async function main() {
   const MAX_ATTEMPTS = 5
 
   async function runWithRetry(): Promise<Awaited<ReturnType<typeof agent.run>>> {
+    let consecutiveRateLimitErrors = 0
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
       currentAttempt = attempt
+
       let result: Awaited<ReturnType<typeof agent.run>>
       try {
         result = await agent.run(task)
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err)
         if (attempt < MAX_ATTEMPTS && (RETRIABLE_RE.test(msg) || TIMEOUT_RE.test(msg))) {
+          if (RETRIABLE_RE.test(msg)) consecutiveRateLimitErrors++
           const delay = BASE_DELAY_MS * attempt
           const errorType = TIMEOUT_RE.test(msg) ? "Timeout" : "Provider"
+
           process.stderr.write(
             `[Retry] ${errorType} error on attempt ${attempt}/${MAX_ATTEMPTS}: ${msg.slice(0, 120)}\n` +
               `[Retry] Waiting ${delay / 1000}s before retrying...\n`,
           )
-          iterationOffset += lastSeenIteration
+          maxIterationFromPreviousRuns += lastSeenIteration
           lastSeenIteration = 0
           await new Promise((r) => setTimeout(r, delay))
           continue
@@ -560,13 +568,15 @@ async function main() {
         const err = result.error ?? new Error(`Agent run ended with status "${result.status}" (model API error?)`)
         const msg = err.message
         if (attempt < MAX_ATTEMPTS && (RETRIABLE_RE.test(msg) || TIMEOUT_RE.test(msg))) {
+          if (RETRIABLE_RE.test(msg)) consecutiveRateLimitErrors++
           const delay = BASE_DELAY_MS * attempt
           const errorType = TIMEOUT_RE.test(msg) ? "Timeout" : "Provider"
+
           process.stderr.write(
             `[Retry] ${errorType} error (status=${result.status}) on attempt ${attempt}/${MAX_ATTEMPTS}: ${msg.slice(0, 120)}\n` +
               `[Retry] Waiting ${delay / 1000}s before retrying...\n`,
           )
-          iterationOffset += lastSeenIteration
+          maxIterationFromPreviousRuns += lastSeenIteration
           lastSeenIteration = 0
           await new Promise((r) => setTimeout(r, delay))
           continue
@@ -574,8 +584,11 @@ async function main() {
         throw err
       }
 
-      // Reset currentAttempt after successful retry so subsequent iterations don't show incorrect retry suffix
+      // Reset currentAttempt and lastSeenIteration after successful retry so subsequent iterations
+      // don't show incorrect retry suffix and iteration offset is correct for next retry if needed
       currentAttempt = 1
+      lastSeenIteration = 0
+      consecutiveRateLimitErrors = 0
       return result
     }
     throw new Error("unreachable")
