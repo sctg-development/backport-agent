@@ -61,6 +61,7 @@ export default defineConfig({
         "dotenv",
         "js-yaml",
         "minimatch",
+        "tiktoken",
         "zod",
       ],
       output: {
