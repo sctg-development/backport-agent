@@ -39,7 +39,7 @@
 
 import { z } from "zod"
 import { defineTool } from "../tool-helper.js"
-import { runValidationSuite } from "./commands.js"
+import { runTrustedSuite, runValidationSuite } from "./commands.js"
 import type { SyncConfig } from "../config/schema.js"
 import type { RiskLevel } from "../risk/classify-risk.js"
 
@@ -58,11 +58,12 @@ export function makeValidationTool(config: SyncConfig) {
     description:
       "Run the validation suite appropriate for a given risk level. " +
       "'low' runs only typecheck. 'medium' adds unit tests. 'high' adds build and integration tests. " +
-      "All commands are allowlisted — arbitrary commands are rejected. " +
+      "'final' runs the comprehensive end-to-end build suite from config.validation.final (call this once after all commits are processed). " +
+      "Config-defined commands run via bash; LLM-supplied extraCommands are subject to the prefix allowlist. " +
       "Returns success status and per-command output.",
     inputSchema: z.object({
-      /** Risk level computed by `classify_commit_risk`. Determines which suite to run. */
-      riskLevel: z.enum(["low", "medium", "high"]).describe("Risk level determines which suite to run"),
+      /** Risk level computed by `classify_commit_risk`, or "final" for the end-to-end build suite. */
+      riskLevel: z.enum(["low", "medium", "high", "final"]).describe("Risk level determines which suite to run; use 'final' for the comprehensive end-to-end build check"),
       /**
        * Optional additional commands to append to the standard suite.
        * Useful for customization-specific verification commands listed in
@@ -80,22 +81,33 @@ export function makeValidationTool(config: SyncConfig) {
         return { dryRun: true, results: [], allPassed: true }
       }
 
-      // Map each risk level to its configured command list from config.validation.
-      const suites: Record<RiskLevel, string[]> = {
+      // Map each level to its configured command list from config.validation.
+      type ValidationLevel = RiskLevel | "final"
+      const suites: Record<ValidationLevel, string[]> = {
         low: config.validation.low,
         medium: config.validation.medium,
         high: config.validation.high,
+        final: config.validation.final ?? [],
       }
 
-      // Combine the standard suite with any caller-provided extra commands.
-      const commands = [...suites[riskLevel], ...extraCommands]
-      // Execute each command in order, stopping on the first failure.
-      const results = runValidationSuite(commands, config.workingDir)
-      const allPassed = results.every((r) => r.success)
+      // Config-defined commands run via bash (supports pushd/popd, &&, etc.).
+      const configCommands = suites[riskLevel]
+      const configResults = runTrustedSuite(configCommands, config.workingDir)
+      const configPassed = configResults.every((r) => r.success)
 
-      return { riskLevel, results, allPassed }
+      // LLM-suggested extraCommands run only when the config suite passed,
+      // and they remain subject to the prefix allowlist.
+      const extraResults =
+        configPassed && extraCommands.length > 0
+          ? runValidationSuite(extraCommands, config.workingDir)
+          : []
+
+      const allResults = [...configResults, ...extraResults]
+      const allPassed = allResults.every((r) => r.success)
+
+      return { riskLevel, results: allResults, allPassed }
     },
-    // 5-minute overall timeout for the entire suite (individual commands have 2-min timeouts).
-    timeoutMs: 300_000,
+    // 10-minute overall timeout: generous enough for full build suites (VSIX packaging, etc.).
+    timeoutMs: 600_000,
   })
 }

@@ -42,7 +42,8 @@
  */
 
 import { z } from "zod"
-import { readFileSync } from "node:fs"
+import { readFileSync, writeFileSync, unlinkSync, existsSync } from "node:fs"
+import { join as joinPath } from "node:path"
 import { minimatch } from "minimatch"
 import { defineTool } from "../tool-helper.js"
 import {
@@ -102,9 +103,35 @@ function matchesResolvePattern(filePath: string, patterns: string[]): boolean {
  * @param config - Validated `SyncConfig` loaded from `config.json`.
  * @returns Array of ten agent tools covering the full git workflow.
  */
+export const CHECKPOINT_FILENAME = ".backport-checkpoint.json"
+
 export function makeGitTools(config: SyncConfig) {
   // Destructure frequently-used config sections for brevity inside each tool.
   const { workingDir, upstream, fork, sync } = config
+
+  // --- Within-run checkpoint state ---
+  // Tracks the current sync branch and successfully applied SHAs so that the
+  // agent can resume from the last successful cherry-pick after a crash or retry.
+  let checkpointSyncBranch: string | null = null
+  let checkpointAppliedShas: string[] = []
+  let currentPickSha: string | null = null
+
+  function writeCheckpoint(): void {
+    if (sync.dryRun) return
+    try {
+      writeFileSync(
+        joinPath(workingDir, CHECKPOINT_FILENAME),
+        JSON.stringify({
+          syncBranch: checkpointSyncBranch,
+          appliedShas: checkpointAppliedShas,
+          timestamp: new Date().toISOString(),
+        }, null, 2),
+        "utf8",
+      )
+    } catch (err) {
+      process.stderr.write(`[Checkpoint] Warning: could not write checkpoint: ${err}\n`)
+    }
+  }
 
   /**
    * Tool: fetch_remotes
@@ -185,26 +212,23 @@ export function makeGitTools(config: SyncConfig) {
   /**
    * Tool: get_commit_details
    *
-   * Returns the file list and (optionally) the full diff for a given commit SHA.
-   * The diff is truncated at 32 000 characters by `getCommitDiff` to protect
-   * the LLM context window.  The agent should call this before risk classification
-   * and before attempting a cherry-pick.
+   * Returns the changed file list for a given commit SHA.
+   * The diff is intentionally NOT exposed here — AI tools (analyze_commit_for_backport,
+   * check_customization_compatibility) fetch it internally as needed to avoid adding
+   * it to the main orchestrator context.
    */
   const getCommitDetailsTool = defineTool({
     name: "get_commit_details",
     description:
-      "Get the changed files and diff for a specific upstream commit. " +
-      "Use this before classifying risk or attempting a cherry-pick.",
+      "Get the list of changed files for a specific upstream commit. " +
+      "Use this before classifying risk. " +
+      "NOTE: The diff is NOT included here — AI analysis tools fetch it internally.",
     inputSchema: z.object({
       sha: z.string().describe("The commit SHA to inspect"),
-      /** Set to false to skip the diff and only retrieve the file list. */
-      includeDiff: z.boolean().default(true),
     }),
-    execute: async ({ sha, includeDiff }) => {
+    execute: async ({ sha }) => {
       const changedFiles = getCommitChangedFiles(workingDir, sha)
-      // Fetch the diff only when explicitly requested to save context tokens.
-      const diff = includeDiff ? getCommitDiff(workingDir, sha) : null
-      return { sha, changedFiles, diff }
+      return { sha, changedFiles }
     },
   })
 
@@ -232,6 +256,8 @@ export function makeGitTools(config: SyncConfig) {
       const time = now.toISOString().slice(11, 19).replace(/:/g, "")  // "HHMMSS"
       const branchName = `${sync.branchPrefix}${upstream.branch}-${date}-${time}`
       createSyncBranch(workingDir, branchName, `${fork.remote}/${fork.branch}`)
+      checkpointSyncBranch = branchName
+      writeCheckpoint()
       return { branchName }
     },
   })
@@ -256,7 +282,14 @@ export function makeGitTools(config: SyncConfig) {
     execute: async ({ sha }) => {
       // Dry-run: report success without touching the repository.
       if (sync.dryRun) return { success: true, dryRun: true, conflictedFiles: [] }
-      return cherryPick(workingDir, sha)
+      currentPickSha = sha
+      const result = cherryPick(workingDir, sha)
+      if (result.success) {
+        checkpointAppliedShas.push(sha)
+        currentPickSha = null
+        writeCheckpoint()
+      }
+      return result
     },
   })
 
@@ -366,6 +399,11 @@ export function makeGitTools(config: SyncConfig) {
       // Skip in dry-run mode.
       if (sync.dryRun) return { committed: false, dryRun: true }
       continueCherryPick(workingDir)
+      if (currentPickSha) {
+        checkpointAppliedShas.push(currentPickSha)
+        currentPickSha = null
+        writeCheckpoint()
+      }
       return { committed: true }
     },
   })

@@ -1,6 +1,6 @@
 {
   "name": "@sctg/backport-agent",
-  "version": "0.4.0",
+  "version": "0.6.0",
   "description": "Generic fork sync & preservation agent powered by @sctg/cline-sdk",
   "type": "module",
   "engines": {
@@ -32,15 +32,17 @@
   },
   "dependencies": {
     "@octokit/rest": "^22.0.1",
-    "@sctg/cline-sdk": "3.89.1-beta.20260612120107",
+    "@sctg/cline-sdk": "3.89.2-beta.20260613190204",
     "dotenv": "^17.4.2",
     "js-yaml": "^4.2.0",
     "minimatch": "^10.0.1",
+    "tiktoken": "^1.0.22",
     "zod": "^4.4.3"
   },
   "devDependencies": {
     "@types/js-yaml": "^4.0.9",
     "@types/node": "^22.19.19",
+    "fast-glob": "^3.3.3",
     "tsx": "^4.22.4",
     "typescript": "^6.0.3",
     "vite": "^8.0.16",

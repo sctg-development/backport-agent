@@ -66,6 +66,7 @@ import { Agent } from "@sctg/cline-sdk"
 import { defineTool } from "../tool-helper.js"
 import type { SyncConfig } from "../config/schema.js"
 import type { Customizations } from "../customizations/schema.js"
+import { getCommitDiff } from "../git/git-client.js"
 import { globSync } from "node:fs"
 import { join as joinPath } from "node:path"
 import { minimatch } from "minimatch"
@@ -158,10 +159,10 @@ export { ConflictResolutionOutputSchema }
 
 /** Expected shape of `analyze_commit_for_backport` model output. */
 const AnalyzeCommitOutputSchema = z.object({
-  summary: z.string(),
-  keyChanges: z.array(z.string()),
+  summary: z.string().max(500),
+  keyChanges: z.array(z.string().max(150)).max(5),
   backportComplexity: z.enum(["trivial", "moderate", "complex"]),
-  semanticRiskFactors: z.array(z.string()),
+  semanticRiskFactors: z.array(z.string().max(200)).max(3),
   recommendation: z.enum(["apply", "apply-with-care", "review-required", "skip"]),
 })
 export { AnalyzeCommitOutputSchema }
@@ -169,10 +170,10 @@ export { AnalyzeCommitOutputSchema }
 /** Expected shape of `check_customization_compatibility` model output. */
 const CheckCompatibilityOutputSchema = z.object({
   compatible: z.boolean(),
-  affectedCustomizations: z.array(z.string()),
-  semanticConflicts: z.array(z.string()),
-  warnings: z.array(z.string()),
-  recommendation: z.string(),
+  affectedCustomizations: z.array(z.string().max(100)).max(5),
+  semanticConflicts: z.array(z.string().max(200)).max(3),
+  warnings: z.array(z.string().max(200)).max(3),
+  recommendation: z.string().max(300),
 })
 export { CheckCompatibilityOutputSchema }
 
@@ -846,17 +847,19 @@ export function makeAiTools(
       commitMessage: z.string().describe("Full commit message (subject + body)"),
 
       /**
-       * Full unified diff of the commit as returned by `git show --format=` or
-       * `git diff <parent> <sha>`.
-       */
-      diff: z.string().describe("Full unified diff of the commit"),
-
-      /**
        * List of file paths changed by this commit (relative to repo root).
+       * Available from `get_commit_details` without requesting the diff.
        */
       changedFiles: z.array(z.string()).describe("List of file paths changed by this commit"),
     }),
-    execute: async ({ sha, commitMessage, diff, changedFiles }) => {
+    execute: async ({ sha, commitMessage, changedFiles }) => {
+      // Fetch the diff internally — keeps it out of the main orchestrator context.
+      const diff = getCommitDiff(config.workingDir, sha)
+      // Large diffs (e.g. bun.lock releases) get the powerful model for better reasoning
+      // and a potentially different quota pool (fewer rate-limit issues).
+      const analysisModel = diff.length > config.ai.largeContextThreshold
+        ? config.models.powerful
+        : config.models.fast
       // Build the fork customization context block once per tool factory (static).
       const forkContextLines: string[] =
         customizations?.customizations.length
@@ -876,14 +879,15 @@ export function makeAiTools(
         "backport it into a heavily customised fork.",
         "",
         ...forkContextLines,
+        "CRITICAL: Be extremely concise. Your entire response must fit in 400 tokens or less.",
         "Output ONLY a valid JSON object with exactly these fields:",
-        '  "summary":             string  — 2-3 sentence description of what this commit does.',
-        '  "keyChanges":          string[] — bullet-point list of the most important code changes.',
+        '  "summary":             string  — max 2 sentences, under 100 words.',
+        '  "keyChanges":          string[] — at most 5 items, each under 20 words.',
         '  "backportComplexity":  "trivial" | "moderate" | "complex"',
         '    - "trivial":   small, isolated change with no side effects.',
         '    - "moderate":  meaningful change but scope is clear and contained.',
         '    - "complex":   refactor, API change, or broad change that may interact with customisations.',
-        '  "semanticRiskFactors": string[] — list of reasons why this commit could break a fork',
+        '  "semanticRiskFactors": string[] — at most 3 items, each under 30 words.',
         '                         (e.g. "renames exported interface", "changes provider registration pattern").',
         '                         Empty array if no risks detected.',
         '  "recommendation":      "apply" | "apply-with-care" | "review-required" | "skip"',
@@ -901,7 +905,7 @@ export function makeAiTools(
         `Output the JSON object now.`
 
       try {
-        const subAgent = makeSubAgent(config.models.fast, systemPrompt, providerId, apiKey)
+        const subAgent = makeSubAgent(analysisModel, systemPrompt, providerId, apiKey)
         const t0 = Date.now()
         const result = await subAgent.run(userPrompt)
         const durationMs = Date.now() - t0
@@ -914,7 +918,7 @@ export function makeAiTools(
               sha,
               commitMessage,
               durationMs,
-              model: config.models.fast
+              model: analysisModel
             })
           }
         }
@@ -945,7 +949,7 @@ export function makeAiTools(
         logPrompt(
           logPath,
           "analyze_commit_for_backport",
-          config.models.fast,
+          analysisModel,
           userPrompt,
           result.outputText ?? "",
           durationMs,
@@ -976,7 +980,7 @@ export function makeAiTools(
         }
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err)
-        logPrompt(logPath, "analyze_commit_for_backport", config.models.fast, userPrompt, "", 0, message)
+        logPrompt(logPath, "analyze_commit_for_backport", analysisModel, userPrompt, "", 0, message)
         logAuditEvent(logPath, "analyze_commit_for_backport", "analysis_failed", { sha, error: message })
         return {
           summary: `Analysis failed: ${message}`,
@@ -1019,9 +1023,10 @@ export function makeAiTools(
       "Use this when classify_commit_risk returns 'medium' or 'high' and you want deeper insight.",
     inputSchema: z.object({
       /**
-       * Full unified diff of the upstream commit being evaluated.
+       * Full commit SHA — the diff is fetched internally to avoid duplicating it
+       * in the main orchestrator context.
        */
-      diff: z.string().describe("Full unified diff of the upstream commit"),
+      sha: z.string().describe("Full commit SHA to evaluate"),
 
       /**
        * List of customisation entries loaded from `customizations.yaml`.
@@ -1045,7 +1050,14 @@ export function makeAiTools(
         )
         .describe("Customisation entries from customizations.yaml"),
     }),
-    execute: async ({ diff, customizations }) => {
+    execute: async ({ sha, customizations }) => {
+      // Fetch the diff internally — keeps it out of the main orchestrator context.
+      const diff = getCommitDiff(config.workingDir, sha)
+      // Route to powerful model for large diffs.
+      const compatModel = diff.length > config.ai.largeContextThreshold
+        ? config.models.powerful
+        : config.models.fast
+
       /**
        * If there are no customisations defined, there is nothing to check.
        * Return a trivially compatible result without calling the LLM.
@@ -1095,17 +1107,17 @@ export function makeAiTools(
         "Your task is to assess whether an upstream Git diff could break the customised behaviour",
         "of a fork, given a list of declared customisations.",
         "",
+        "CRITICAL: Be extremely concise. Your entire response must fit in 300 tokens or less.",
         "Output ONLY a valid JSON object with exactly these fields:",
         '  "compatible":             boolean — true if the upstream change is unlikely to break any customisation.',
-        '  "affectedCustomizations": string[] — names/patterns of customisations potentially affected.',
-        '  "semanticConflicts":      string[] — specific ways the upstream change could break fork behaviour.',
+        '  "affectedCustomizations": string[] — at most 5 items, each under 100 chars.',
+        '  "semanticConflicts":      string[] — at most 3 items, each under 200 chars.',
         '                            Each entry is a concrete description (e.g. "renames ApiProvider enum',
         '                            value used by keypoollive provider registration").',
         '                            Empty array if no conflicts detected.',
-        '  "warnings":               string[] — non-blocking concerns worth noting (e.g. "touches shared types',
-        '                            used by customised components").',
+        '  "warnings":               string[] — at most 3 items, each under 200 chars.',
         '                            Empty array if none.',
-        '  "recommendation":         string — one sentence advising the agent what to do.',
+        '  "recommendation":         string — one sentence (under 300 chars) advising the agent what to do.',
         "",
         "Important: focus on SEMANTIC compatibility, not textual conflicts.",
         "A change can be textually clean but still break the fork (e.g. renaming an interface",
@@ -1118,7 +1130,7 @@ export function makeAiTools(
         `Output the JSON object now.`
 
       try {
-        const subAgent = makeSubAgent(config.models.fast, systemPrompt, providerId, apiKey)
+        const subAgent = makeSubAgent(compatModel, systemPrompt, providerId, apiKey)
         const t0 = Date.now()
         const result = await subAgent.run(userPrompt)
         const durationMs = Date.now() - t0
@@ -1129,7 +1141,7 @@ export function makeAiTools(
           if (isTimeoutError(errorMessage)) {
             logTimeoutError(logPath, "check_customization_compatibility", errorMessage, {
               durationMs,
-              model: config.models.fast,
+              model: compatModel,
               customizationCount: customizations.length
             })
           }
@@ -1146,7 +1158,7 @@ export function makeAiTools(
         logPrompt(
           logPath,
           "check_customization_compatibility",
-          config.models.fast,
+          compatModel,
           userPrompt,
           result.outputText ?? "",
           durationMs,

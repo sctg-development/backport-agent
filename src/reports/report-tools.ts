@@ -51,9 +51,10 @@
  */
 
 import { z } from "zod"
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs"
+import { readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync } from "node:fs"
 import { resolve as resolvePath, join as joinPath, relative as relativePath } from "node:path"
 import { git } from "../git/git-client.js"
+import { CHECKPOINT_FILENAME } from "../git/git-tools.js"
 import { Agent } from "@sctg/cline-sdk"
 import { defineTool } from "../tool-helper.js"
 import type { SyncConfig } from "../config/schema.js"
@@ -313,6 +314,14 @@ export function makeReportTool(
     // completesRun:true tells the SDK to stop the agent loop after this tool returns.
     lifecycle: { completesRun: true },
     execute: async ({ syncBranch, upstreamRef, forkRef, commitResults, blockedCommits, agentDecisions, allCandidateShas }) => {
+      // Remove the within-run checkpoint — the run completed successfully.
+      try {
+        const checkpointPath = joinPath(config.workingDir, CHECKPOINT_FILENAME)
+        if (existsSync(checkpointPath)) unlinkSync(checkpointPath)
+      } catch {
+        // Non-fatal — checkpoint cleanup failure must not prevent report generation.
+      }
+
       const date = new Date().toISOString()
       const timestampSlug = date.replace(/[:.]/g, "-").replace("T", "_").slice(0, 19)
 

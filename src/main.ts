@@ -46,7 +46,7 @@
  *  vault-based key rotation via `KEYPOOL_VAULT_URL`.
  */
 /// <reference types="node" />
-import { existsSync, mkdirSync } from "node:fs"
+import { existsSync, mkdirSync, readFileSync } from "node:fs"
 import { resolve as resolvePath, join as joinPath } from "node:path"
 import { parseCliArgs } from "./cli/args.js"
 import { loadConfig } from "./config/loader.js"
@@ -56,6 +56,7 @@ import { buildNoopSyncReport } from "./reports/noop-report.js"
 import { setupAgent } from "./agent/agent-setup.js"
 import { setupEventHandlers } from "./agent/event-handlers.js"
 import { runWithRetry } from "./agent/retry-logic.js"
+import { CHECKPOINT_FILENAME } from "./git/git-tools.js"
 import type { SyncConfig } from "./config/schema.js"
 
 // ---------------------------------------------------------------------------
@@ -155,14 +156,40 @@ async function main() {
 
   // --- Agent setup ---
   const verbose = process.env.VERBOSE === "true"
-  const { agent, userInstructionService, keypoolStats } = await setupAgent({
+  const { agentFactory, userInstructionService, keypoolStats } = await setupAgent({
     config,
     promptLogPath,
     verbose
   })
 
   // --- Event handlers setup ---
-  const eventHandlers = setupEventHandlers({ agent, verbose })
+  // No agent passed here — subscribeToAgent() is called inside runWithRetry for each attempt.
+  const eventHandlers = setupEventHandlers({ verbose })
+
+  // --- Checkpoint resumption ---
+  // If a previous run left a checkpoint file (crash mid-run), include the
+  // already-applied SHAs in the task so the agent skips them.
+  const checkpointPath = joinPath(config.workingDir, CHECKPOINT_FILENAME)
+  let checkpointNote = ""
+  if (existsSync(checkpointPath)) {
+    try {
+      const cp = JSON.parse(readFileSync(checkpointPath, "utf8")) as {
+        syncBranch?: string | null
+        appliedShas?: string[]
+        timestamp?: string
+      }
+      if (cp.appliedShas && cp.appliedShas.length > 0) {
+        checkpointNote =
+          `\nPrevious run checkpoint found (from ${cp.timestamp ?? "unknown"}):\n` +
+          `  Sync branch: ${cp.syncBranch ?? "(not yet created)"}\n` +
+          `  Already applied SHAs (skip these — do NOT re-apply):\n` +
+          cp.appliedShas.map((s) => `    - ${s}`).join("\n") + "\n"
+        process.stderr.write(`[Checkpoint] Resuming from checkpoint: ${cp.appliedShas.length} SHA(s) already applied\n`)
+      }
+    } catch {
+      process.stderr.write(`[Checkpoint] Warning: could not read checkpoint file — starting fresh\n`)
+    }
+  }
 
   // --- Task construction ---
   const dryRunNote = config.sync.dryRun ? " [DRY RUN — no changes will be pushed]" : ""
@@ -175,7 +202,8 @@ async function main() {
     `\`${config.upstream.repo}@${config.upstream.branch}\`.${dryRunNote}\n\n` +
     `Working directory: ${config.workingDir}\n` +
     `Max commits per run: ${config.sync.maxCommitsPerRun}\n` +
-    autoMergeNote
+    autoMergeNote +
+    checkpointNote
 
   console.error(`\n=== Backport Agent starting${dryRunNote} ===\n`)
 
@@ -184,20 +212,26 @@ async function main() {
   // (`lifecycle: { completesRun: true }`) or an unrecoverable error occurs.
   try {
     const result = await runWithRetry({
-      agent,
+      agentFactory,
       task,
       eventHandlers,
-      lastSeenIteration: 0
+      getLastInputTokens: () => keypoolStats.lastInputTokens,
     })
 
     console.error(`\n=== Run complete ===\n`)
     if (result.outputText) {
-      // The generate_report tool completes the run; outputText is the Markdown summary.
+      // The run may complete via generate_report (JSON output) or submit_and_exit (plain text).
+      // Try to extract the Markdown report from JSON; fall back to plain text.
+      let reportMarkdown: string
+      try {
+        const parsedReport = JSON.parse(result.outputText) as { report?: string }
+        reportMarkdown = parsedReport.report ?? result.outputText
+      } catch {
+        // submit_and_exit returned plain text — strip the acknowledgment prefix if present
+        reportMarkdown = result.outputText.replace(/^submit_and_exit acknowledged \([^)]+\):\s*/, "")
+      }
+      console.log(reportMarkdown)
       if (verbose) {
-        // In verbose mode, display only the markdown report
-        const parsedReport = JSON.parse(result.outputText)
-        console.log(parsedReport.report)
-
         // Shows a one line command for merging the new branch in the terminal, if the report contains a new branch to merge.
         const commandLine = `# Sample merge command:
   pushd ${config.workingDir}
@@ -206,8 +240,6 @@ async function main() {
      git push
   popd`
         console.log(commandLine)
-      } else {
-        console.log(result.outputText)
       }
     } else {
       // With requireCompletionTool: true this should never happen on a clean run.

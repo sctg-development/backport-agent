@@ -1,3 +1,4 @@
+#!/usr/bin/env tsx
 // Copyright (c) 2026 Ronan Le Meillat - SCTG Development
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -18,7 +19,6 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-#!/usr/bin/env tsx
 /**
  * @file tools/benchmark-replay.ts
  *

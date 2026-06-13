@@ -41,7 +41,7 @@
  * receives a clear, actionable error rather than a wall of cascading output.
  */
 
-import { execFileSync } from "node:child_process"
+import { execFileSync, spawnSync } from "node:child_process"
 
 /**
  * Result of running a single validation command.
@@ -207,6 +207,62 @@ export function runValidationSuite(commands: string[], cwd: string): CommandResu
     const result = runValidationCommand(command, cwd)
     results.push(result)
     // Stop on first failure — no point running further checks.
+    if (!result.success) break
+  }
+  return results
+}
+
+/**
+ * Runs a single shell command from the config without any allowlist check.
+ *
+ * This is used for developer-defined commands in `config.validation.*` (low, medium,
+ * high, final).  Because these commands originate from a trusted config file (not from
+ * the LLM), they bypass the prefix allowlist and are executed via `bash -c` so that
+ * compound syntax (`cd dir && cmd`, `pushd`/`popd`, pipes, semicolons…) works correctly.
+ *
+ * The 5-minute timeout is generous enough for full build steps (VSIX packaging, etc.).
+ *
+ * @param command - Shell command string, e.g. `"cd apps/vscode && bun install"`.
+ * @param cwd     - Absolute working directory passed to bash.
+ * @returns A `CommandResult` indicating success/failure and captured output.
+ */
+export function runShellCommand(command: string, cwd: string): CommandResult {
+  const result = spawnSync("bash", ["-c", command], {
+    cwd,
+    encoding: "utf-8",
+    stdio: ["pipe", "pipe", "pipe"],
+    timeout: 300_000,
+  })
+
+  if (result.error) {
+    return {
+      command,
+      success: false,
+      exitCode: 1,
+      output: result.error.message,
+    }
+  }
+
+  const output = [result.stdout, result.stderr].filter(Boolean).join("\n")
+  const exitCode = result.status ?? 1
+  return { command, success: exitCode === 0, exitCode, output }
+}
+
+/**
+ * Runs an ordered list of trusted (config-defined) shell commands via `bash -c`.
+ *
+ * Uses the same fail-fast semantics as `runValidationSuite` but calls `runShellCommand`
+ * instead of the allowlisted runner, so compound commands are fully supported.
+ *
+ * @param commands - Ordered array of shell command strings.
+ * @param cwd      - Absolute working directory for all commands.
+ * @returns Array of `CommandResult` objects, stopping on the first failure.
+ */
+export function runTrustedSuite(commands: string[], cwd: string): CommandResult[] {
+  const results: CommandResult[] = []
+  for (const command of commands) {
+    const result = runShellCommand(command, cwd)
+    results.push(result)
     if (!result.success) break
   }
   return results

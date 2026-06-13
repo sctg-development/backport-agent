@@ -146,8 +146,27 @@ export const SyncConfigSchema = z.object({
        * Defaults to 200.
        */
       maxIterations: z.number().int().positive().default(200),
-      /** Maximum number of upstream commits to process in a single agent run. Defaults to 20. */
-      maxCommitsPerRun: z.number().int().positive().default(20),
+      /** Maximum number of upstream commits to process in a single agent run. Defaults to 5. */
+      maxCommitsPerRun: z.number().int().positive().default(5),
+      /**
+       * Input token threshold at which the agent injects a "wrap up now" message, instructing
+       * it to call generate_report immediately with work done so far.
+       * Set this below the model's context window minus a safe response budget.
+       * For devstral-medium-latest (262k limit) the default of 220_000 leaves ~42k for the
+       * final response + tool results.
+       * A hard abort fires at min(maxContextTokens × 1.15, 260_000) to prevent the fatal
+       * HTTP 400 that occurs when the prompt exceeds the model limit.
+       * Defaults to 220_000.
+       */
+      maxContextTokens: z.number().int().positive().default(220_000),
+      /**
+       * Input token count at which `prepareTurn` triggers automatic context compaction.
+       * The compaction hook serializes the conversation and asks a large-context summarizer
+       * model to distill it into a compact progress summary, resetting the in-context history
+       * to ~15k tokens so the run can continue processing remaining commits.
+       * Set below `maxContextTokens`. Defaults to 180_000.
+       */
+      compactionThreshold: z.number().int().positive().default(180_000),
       /**
        * Depth used when first fetching remote refs.
        * Shallow enough to be fast; `ensureMergeBase` will deepen if necessary. Defaults to 200.
@@ -317,6 +336,24 @@ export const SyncConfigSchema = z.object({
         .string()
         .default("mistral/magistral-medium-latest")
         .describe("High-capability model for conflict resolution (fallback)"),
+      /**
+       * Optional model used exclusively for context compaction (the `prepareTurn` hook).
+       * Must have a large enough context window to ingest the full conversation transcript
+       * (~200k tokens) — Gemini 2.5 Flash (1M context) is the recommended choice.
+       * If absent, falls back to `models.specialist` with the same provider.
+       *
+       * With keypoollive vault:
+       *   { "provider": "keypoollive", "modelId": "gemini/gemini-2.5-flash-preview" }
+       * With direct Gemini API key:
+       *   { "provider": "gemini", "modelId": "gemini-2.5-flash-preview", "apiKey": "$GEMINI_API_KEY" }
+       */
+      summarizer: z
+        .object({
+          provider: z.string(),
+          modelId: z.string(),
+          apiKey: z.string().optional(),
+        })
+        .optional(),
     })
     // Allow omitting the entire models block; individual fields carry defaults.
     .default(() => ({} as any)),
@@ -428,6 +465,21 @@ export const SyncConfigSchema = z.object({
         .max(1)
         .default(0.5)
         .describe("Weight for analyze_commit severity in weighted mode (0=full compat weight, 1=full analyze weight)"),
+
+      /**
+       * Diff size threshold (in characters) above which AI analysis tools
+       * route to `models.powerful` instead of `models.fast`.
+       * Large diffs (e.g. bun.lock releases) may exceed the fast model's
+       * reasoning quality; a powerful model handles them more accurately and
+       * may also have fewer rate-limit issues due to a different quota pool.
+       * Defaults to `20000` (~5k tokens).
+       */
+      largeContextThreshold: z
+        .number()
+        .int()
+        .positive()
+        .default(20_000)
+        .describe("Diff size (chars) above which AI analysis uses models.powerful instead of models.fast"),
     })
     .default(() => ({} as any)),
 
@@ -513,6 +565,18 @@ export const SyncConfigSchema = z.object({
        * Defaults to typecheck + unit tests + full build.
        */
       high: z.array(z.string()).default(["npm run typecheck", "npm run test:unit", "npm run build"]),
+      /**
+       * Comprehensive end-to-end build commands run once at the end of a sync run,
+       * after per-commit validation.  Intended for full build/package steps that are
+       * too expensive to repeat after each commit but must pass before the PR is created.
+       *
+       * Each entry is a shell command executed via `bash -c` with `workingDir` as cwd,
+       * so compound commands (`cd apps/vscode && bun install`), `pushd`/`popd`, etc.
+       * are all supported.
+       *
+       * Defaults to `[]` (disabled).
+       */
+      final: z.array(z.string()).default([]),
     })
     // Allow omitting the entire validation block; individual fields carry defaults.
     .default(() => ({} as any)),

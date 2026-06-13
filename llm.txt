@@ -1,0 +1,29 @@
+Backport-agent e-commerce framework — source index (2026-06-13)
+Stack: Cline SDK with name @sctg/cline-sdk
+
+FILES
+  src/agent/agent-setup.ts
+  src/agent/context-compaction.ts
+  src/agent/event-handlers.ts
+  src/agent/retry-logic.ts
+  src/agent/system-prompt.ts
+  src/ai/ai-tools.ts
+  src/cli/args.ts
+  src/config/loader.ts
+  src/config/provider.ts
+  src/config/schema.ts
+  src/customizations/loader.ts
+  src/customizations/schema.ts
+  src/git/git-client.ts
+  src/git/git-init.ts
+  src/git/git-tools.ts
+  src/github/github-tools.ts
+  src/main.ts
+  src/reports/noop-report.ts
+  src/reports/report-tools.ts
+  src/risk/classify-risk.ts
+  src/risk/risk-tools.ts
+  src/tool-helper.ts
+  src/tools/benchmark-replay.ts
+  src/validation/commands.ts
+  src/validation/validation-tools.ts
