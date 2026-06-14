@@ -67,7 +67,7 @@ describe("loadConfig", () => {
 
     expect(config.upstream.remote).toBe("upstream")
     expect(config.fork.remote).toBe("origin")
-    expect(config.sync.maxCommitsPerRun).toBe(20)
+    expect(config.sync.maxCommitsPerRun).toBe((5))
     expect(config.models.fast).toBe("mistral/devstral-latest")
     expect(config.validation.low).toEqual(["npm run typecheck"])
   })
