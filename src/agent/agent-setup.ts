@@ -227,8 +227,12 @@ export async function setupAgent(params: AgentSetupParams): Promise<AgentSetupRe
   const riskTool = makeRiskTool(config, customizations) // 1 tool for risk classification
   const validationTool = makeValidationTool(config)     // 1 tool for validation suite
   const githubTools = makeGitHubTools(config)           // 3 tools for GitHub PR management
-  const reportTool = makeReportTool(config, promptLogPath, config.models.provider, resolveApiKey(config)) // 1 terminal tool (completesRun: true)
-  const aiTools = makeAiTools(config, promptLogPath, config.models.provider, resolveApiKey(config), customizations) // 4 AI-powered analysis tools
+  // Pass handleKeypoolEvent so sub-agents (ai-tools, report-tools) have their
+  // token usage tracked in keypoolStats — otherwise only the main agent's calls
+  // appear in the detailed key usage report.
+  const keypoolHandler = config.models.provider === "keypoollive" ? handleKeypoolEvent : undefined
+  const reportTool = makeReportTool(config, promptLogPath, config.models.provider, resolveApiKey(config), keypoolHandler) // 1 terminal tool (completesRun: true)
+  const aiTools = makeAiTools(config, promptLogPath, config.models.provider, resolveApiKey(config), customizations, keypoolHandler) // 4 AI-powered analysis tools
 
   // --- SDK built-in tools ---
   const builtinTools = createBuiltinTools({
