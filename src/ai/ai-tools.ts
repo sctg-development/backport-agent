@@ -349,12 +349,15 @@ export function checkSyntaxBalance(
   // Strip line comments, block comments, and string/template literals.
   // Template literals are stripped as opaque strings (simplified — does not
   // handle nested template expressions, which is fine for this use-case).
+  // Strip strings BEFORE comments: a "//" inside a string (e.g. URL) must not
+  // be matched by the line-comment regex, which would strip the closing quote
+  // and leave unbalanced braces visible to the counter (false positives).
   const stripped = content
-    .replace(/\/\/[^\n]*/g, "")
-    .replace(/\/\*[\s\S]*?\*\//g, "")
     .replace(/"(?:[^"\\]|\\.)*"/g, '""')
     .replace(/'(?:[^'\\]|\\.)*'/g, "''")
     .replace(/`(?:[^`\\]|\\.)*`/g, "``")
+    .replace(/\/\/[^\n]*/g, "")
+    .replace(/\/\*[\s\S]*?\*\//g, "")
 
   let braces = 0, parens = 0, brackets = 0
   for (const ch of stripped) {
@@ -432,16 +435,23 @@ export function detectHallucinatedFileRefs(
   )
 }
 
+// Infer the keypoolEventHandler type from Agent's constructor options so we
+// don't need to import it from @sctg/cline-shared directly.
+type KeypoolEventHandler = NonNullable<Parameters<typeof Agent>[0]> extends
+  { keypoolEventHandler?: (e: infer E) => void } ? ((e: E) => void) : never
+
 /**
  * Creates a minimal sub-`Agent` for a single-turn AI reasoning call.
  *
  * The sub-agent has an empty tools array — it performs a single reasoning turn
  * and returns its text output via `result.outputText`.
  *
- * @param modelId      - Model identifier to use (fast or powerful).
- * @param systemPrompt - System prompt that scopes the sub-agent's behaviour.
- * @param providerId   - LLM provider ID (e.g. `"anthropic"`, `"keypoollive"`).
- * @param apiKey       - Resolved API key (or `undefined` to let the SDK discover it).
+ * @param modelId              - Model identifier to use (fast or powerful).
+ * @param systemPrompt         - System prompt that scopes the sub-agent's behaviour.
+ * @param providerId           - LLM provider ID (e.g. `"anthropic"`, `"keypoollive"`).
+ * @param apiKey               - Resolved API key (or `undefined` to let the SDK discover it).
+ * @param keypoolEventHandler  - Optional keypool event handler forwarded from the main agent
+ *                               so that sub-agent token usage is tracked in keypoolStats.
  * @returns A configured `Agent` instance ready to call `.run(userPrompt)`.
  */
 function makeSubAgent(
@@ -449,6 +459,7 @@ function makeSubAgent(
   systemPrompt: string,
   providerId: string,
   apiKey: string | undefined,
+  keypoolEventHandler?: KeypoolEventHandler,
 ): Agent {
   return new Agent({
     providerId,
@@ -456,6 +467,7 @@ function makeSubAgent(
     apiKey,
     systemPrompt,
     tools: [],
+    ...(keypoolEventHandler ? { keypoolEventHandler } : {}),
   })
 }
 
@@ -481,6 +493,7 @@ export function makeAiTools(
   providerId: string,
   apiKey: string | undefined,
   customizations?: Customizations,
+  keypoolEventHandler?: KeypoolEventHandler,
 ) {
   // -------------------------------------------------------------------------
   // Tool 1: resolve_conflict_with_ai
@@ -638,7 +651,7 @@ export function makeAiTools(
           await new Promise((r) => setTimeout(r, 2_000))
         }
         try {
-          const subAgent = makeSubAgent(modelId, systemPrompt, providerId, apiKey)
+          const subAgent = makeSubAgent(modelId, systemPrompt, providerId, apiKey, keypoolEventHandler)
           const t0 = Date.now()
           const result = await subAgent.run(userPrompt)
           const durationMs = Date.now() - t0
@@ -696,7 +709,7 @@ export function makeAiTools(
           let consensusFailure = false
           if (config.ai.enableConflictConsensus && label === "specialist" && !hasConflictMarkers) {
             try {
-              const consensusAgent = makeSubAgent(config.models.powerful, systemPrompt, providerId, apiKey)
+              const consensusAgent = makeSubAgent(config.models.powerful, systemPrompt, providerId, apiKey, keypoolEventHandler)
               const ct0 = Date.now()
               const consensusResult = await consensusAgent.run(userPrompt)
               const consensusDurationMs = Date.now() - ct0
@@ -905,7 +918,7 @@ export function makeAiTools(
         `Output the JSON object now.`
 
       try {
-        const subAgent = makeSubAgent(analysisModel, systemPrompt, providerId, apiKey)
+        const subAgent = makeSubAgent(analysisModel, systemPrompt, providerId, apiKey, keypoolEventHandler)
         const t0 = Date.now()
         const result = await subAgent.run(userPrompt)
         const durationMs = Date.now() - t0
@@ -1130,7 +1143,7 @@ export function makeAiTools(
         `Output the JSON object now.`
 
       try {
-        const subAgent = makeSubAgent(compatModel, systemPrompt, providerId, apiKey)
+        const subAgent = makeSubAgent(compatModel, systemPrompt, providerId, apiKey, keypoolEventHandler)
         const t0 = Date.now()
         const result = await subAgent.run(userPrompt)
         const durationMs = Date.now() - t0
