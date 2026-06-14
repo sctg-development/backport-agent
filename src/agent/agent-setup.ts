@@ -50,6 +50,19 @@ interface AgentSetupParams {
   verbose: boolean
 }
 
+interface KeyUsage {
+  event: string
+  owner: string
+  keyHint: string
+  modelId: string
+  usage?: {
+    input: number
+    output: number
+    cacheRead: number
+    cacheWrite: number
+  }
+}
+
 interface AgentSetupResult {
   /** Factory that creates a fresh Agent for each retry attempt. */
   agentFactory: () => Agent
@@ -61,7 +74,7 @@ interface AgentSetupResult {
     totalCacheWriteTokens: number
     rotations: number
     exhaustions: number
-    keysUsed: Set<string>
+    keysUsed: Set<KeyUsage>
     /** Input token count of the most recent successful LLM call (0 before first call). */
     lastInputTokens: number
   }
@@ -282,7 +295,7 @@ export async function setupAgent(params: AgentSetupParams): Promise<AgentSetupRe
     totalCacheWriteTokens: 0,
     rotations: 0,
     exhaustions: 0,
-    keysUsed: new Set<string>(),
+    keysUsed: new Set<KeyUsage>(),
     lastInputTokens: 0,
   }
 
@@ -302,7 +315,7 @@ export async function setupAgent(params: AgentSetupParams): Promise<AgentSetupRe
           (event.keyOwner ? ` (${event.keyOwner})` : "") +
           ` — ${event.providerName}/${event.modelId}\n`,
         )
-        keypoolStats.keysUsed.add(event.keyHint)
+        keypoolStats.keysUsed.add({ event: event.type, owner: event.keyOwner ?? "(unknown)", keyHint: event.keyHint, modelId: event.modelId })
         break
       case "key-rotated":
         keypoolStats.rotations++
@@ -328,7 +341,7 @@ export async function setupAgent(params: AgentSetupParams): Promise<AgentSetupRe
         keypoolStats.totalOutputTokens += event.outputTokens
         keypoolStats.totalCacheReadTokens += event.cacheReadTokens
         keypoolStats.totalCacheWriteTokens += event.cacheWriteTokens
-        keypoolStats.keysUsed.add(event.keyHint)
+        keypoolStats.keysUsed.add({ event: event.type, owner: event.keyOwner ?? "(unknown)", keyHint: event.keyHint, modelId: event.modelId, usage: { input: event.inputTokens, output: event.outputTokens, cacheRead: event.cacheReadTokens, cacheWrite: event.cacheWriteTokens } })
         keypoolStats.lastInputTokens = event.inputTokens
         // Warn when the main orchestrator context approaches saturation.
         // This fires before the fatal error so the operator can act.
