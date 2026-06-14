@@ -76,6 +76,116 @@ parseCliArgs()
 }
 
 // ---------------------------------------------------------------------------
+// Key usage reporting functions
+// ---------------------------------------------------------------------------
+
+/**
+ * Generates a detailed key usage report from keypoolStats.
+ * @param keypoolStats - The keypool statistics object
+ * @returns Markdown formatted key usage report
+ */
+function generateKeyUsageReport(keypoolStats: {
+  keysUsed: Set<{
+    event: string
+    owner: string
+    keyHint: string
+    modelId: string
+    usage?: {
+      input: number
+      output: number
+      cacheRead: number
+      cacheWrite: number
+    }
+  }>
+}) {
+  // Filter only usage-recorded events
+  const usageRecords = Array.from(keypoolStats.keysUsed).filter(
+    (usage) => usage.event === "usage-recorded" && usage.usage
+  )
+
+  if (usageRecords.length === 0) {
+    return ""
+  }
+
+  // Calculate tokens by modelId
+  const tokensByModelId = new Map<string, { input: number; output: number; total: number }>()
+  for (const record of usageRecords) {
+    if (record.usage) {
+      const current = tokensByModelId.get(record.modelId) || { input: 0, output: 0, total: 0 }
+      tokensByModelId.set(record.modelId, {
+        input: current.input + record.usage.input,
+        output: current.output + record.usage.output,
+        total: current.total + record.usage.input + record.usage.output
+      })
+    }
+  }
+
+  // Calculate tokens by key and modelId
+  const tokensByKeyAndModelId = new Map<string, Map<string, { input: number; output: number; total: number }>>()
+  for (const record of usageRecords) {
+    if (record.usage) {
+      const keyMap = tokensByKeyAndModelId.get(record.keyHint) || new Map()
+      const current = keyMap.get(record.modelId) || { input: 0, output: 0, total: 0 }
+      keyMap.set(record.modelId, {
+        input: current.input + record.usage.input,
+        output: current.output + record.usage.output,
+        total: current.total + record.usage.input + record.usage.output
+      })
+      tokensByKeyAndModelId.set(record.keyHint, keyMap)
+    }
+  }
+
+  // Generate the report
+  const reportLines: string[] = []
+
+  reportLines.push("## Detailed Key Usage Report")
+  reportLines.push("")
+  reportLines.push("### Tokens by Model ID")
+  reportLines.push("")
+  reportLines.push("| Model ID | Input Tokens | Output Tokens | Total Tokens |")
+  reportLines.push("|---|---|---|---|")
+
+  // Sort by total tokens descending
+  const sortedModels = Array.from(tokensByModelId.entries()).sort(
+    (a, b) => b[1].total - a[1].total
+  )
+
+  for (const [modelId, tokens] of sortedModels) {
+    reportLines.push(
+      `| \`${modelId}\` | ${tokens.input.toLocaleString()} | ${tokens.output.toLocaleString()} | ${tokens.total.toLocaleString()} |`
+    )
+  }
+
+  reportLines.push("")
+  reportLines.push("### Tokens by Key and Model ID")
+  reportLines.push("")
+  reportLines.push("| Key Hint | Model ID | Input Tokens | Output Tokens | Total Tokens |")
+  reportLines.push("|---|---|---|---|---|")
+
+  // Sort keys by total usage descending
+  const sortedKeys = Array.from(tokensByKeyAndModelId.entries()).sort((a, b) => {
+    const totalA = Array.from(a[1].values()).reduce((sum, t) => sum + t.total, 0)
+    const totalB = Array.from(b[1].values()).reduce((sum, t) => sum + t.total, 0)
+    return totalB - totalA
+  })
+
+  for (const [keyHint, modelMap] of sortedKeys) {
+    // Sort models by usage for this key
+    const sortedModelsForKey = Array.from(modelMap.entries()).sort(
+      (a, b) => b[1].total - a[1].total
+    )
+
+    for (const [modelId, tokens] of sortedModelsForKey) {
+      reportLines.push(
+        `| \`${keyHint}\` | \`${modelId}\` | ${tokens.input.toLocaleString()} | ${tokens.output.toLocaleString()} | ${tokens.total.toLocaleString()} |`
+      )
+    }
+  }
+
+  return reportLines.join("\n")
+}
+
+// ---------------------------------------------------------------------------
 // Entry point — async main() is wrapped in .catch() for clean error exit.
 // ---------------------------------------------------------------------------
 
@@ -210,6 +320,7 @@ async function main() {
   // --- Run the agent with retry logic ---
   // The agent loop runs until the `generate_report` tool is called
   // (`lifecycle: { completesRun: true }`) or an unrecoverable error occurs.
+  let reportMarkdown: string | null = null
   try {
     const result = await runWithRetry({
       agentFactory,
@@ -222,7 +333,6 @@ async function main() {
     if (result.outputText) {
       // The run may complete via generate_report (JSON output) or submit_and_exit (plain text).
       // Try to extract the Markdown report from JSON; fall back to plain text.
-      let reportMarkdown: string
       try {
         const parsedReport = JSON.parse(result.outputText) as { report?: string }
         reportMarkdown = parsedReport.report ?? result.outputText
@@ -264,6 +374,13 @@ async function main() {
         process.stderr.write(
           `[Keypool] WARNING: ${keypoolStats.exhaustions} exhaustion event(s) — all keys were rate-limited simultaneously.\n`,
         )
+      }
+
+      // Generate detailed key usage report and append to reportMarkdown
+      if (reportMarkdown) {
+        const keyUsageReport = generateKeyUsageReport(keypoolStats)
+        const updatedReport = reportMarkdown + "\n\n" + keyUsageReport
+        console.log(updatedReport)
       }
     }
   }
