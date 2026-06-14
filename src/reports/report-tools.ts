@@ -141,21 +141,28 @@ function readPromptLog(logPath: string): { prompts: PromptLogEntry[]; auditEvent
   }
 }
 
+// Infer the keypoolEventHandler type from Agent's constructor options.
+type KeypoolEventHandler = NonNullable<Parameters<typeof Agent>[0]> extends
+  { keypoolEventHandler?: (e: infer E) => void } ? ((e: E) => void) : never
+
 /**
  * Instantiates a minimal sub-Agent with no tools for a single reasoning turn.
  * Identical in purpose to the helper in `ai-tools.ts` but local to avoid a
  * cross-module import cycle.
  *
- * @param modelId      - Model identifier to use for the sub-agent.
- * @param systemPrompt - System prompt to inject.
- * @param providerId   - Provider identifier (e.g. `"openai"`, `"anthropic"`).
- * @param apiKey       - API key for the provider, or `undefined` if using env-based auth.
+ * @param modelId             - Model identifier to use for the sub-agent.
+ * @param systemPrompt        - System prompt to inject.
+ * @param providerId          - Provider identifier (e.g. `"openai"`, `"anthropic"`).
+ * @param apiKey              - API key for the provider, or `undefined` if using env-based auth.
+ * @param keypoolEventHandler - Optional keypool event handler forwarded from the main agent
+ *                              so that sub-agent token usage is tracked in keypoolStats.
  */
 function makeReportSubAgent(
   modelId: string,
   systemPrompt: string,
   providerId: string,
   apiKey: string | undefined,
+  keypoolEventHandler?: KeypoolEventHandler,
 ): Agent {
   return new Agent({
     providerId,
@@ -163,6 +170,7 @@ function makeReportSubAgent(
     apiKey,
     systemPrompt,
     tools: [],
+    ...(keypoolEventHandler ? { keypoolEventHandler } : {}),
   })
 }
 
@@ -191,6 +199,7 @@ async function generateMermaidDiagram(
   runSummary: string,
   providerId: string,
   apiKey: string | undefined,
+  keypoolEventHandler?: KeypoolEventHandler,
 ): Promise<string> {
   const systemPrompt = `You are a technical diagram generator. When given a summary of a Git backport agent run, \
 produce a single Mermaid flowchart (flowchart TD) that visually represents: \
@@ -207,7 +216,7 @@ Output ONLY the raw Mermaid code, no prose, no code fence.`
   const userPrompt = `Agent run summary:\n\n${runSummary}\n\nOutput the Mermaid flowchart now.`
 
   try {
-    const subAgent = makeReportSubAgent(config.models.fast, systemPrompt, providerId, apiKey)
+    const subAgent = makeReportSubAgent(config.models.fast, systemPrompt, providerId, apiKey, keypoolEventHandler)
     const result = await subAgent.run(userPrompt)
     const raw = (result.outputText ?? "").trim()
     // Strip any accidental code fence if the model added one.
@@ -276,6 +285,7 @@ export function makeReportTool(
   promptLogPath: string,
   providerId: string,
   apiKey: string | undefined,
+  keypoolEventHandler?: KeypoolEventHandler,
 ) {
   return defineTool({
     name: "generate_report",
@@ -423,7 +433,7 @@ export function makeReportTool(
         `AI calls: ${readPromptLog(promptLogPath).prompts.map((e) => `${e.tool}(${e.model}, ${e.durationMs}ms)`).join(", ") || "none"}`,
       ].join("\n")
 
-      const mermaidBlock = await generateMermaidDiagram(config, runSummaryForDiagram, providerId, apiKey)
+      const mermaidBlock = await generateMermaidDiagram(config, runSummaryForDiagram, providerId, apiKey, keypoolEventHandler)
 
       // Read and format the prompt log entries.
       const { prompts: promptEntries, auditEvents } = readPromptLog(promptLogPath)
