@@ -20,7 +20,6 @@
 
 import { defineConfig } from "vite"
 import { resolve } from "node:path"
-import { builtinModules } from "node:module"
 
 /**
  * Vite 8 build configuration for @sctg/backport-agent.
@@ -51,19 +50,10 @@ export default defineConfig({
     },
 
     rollupOptions: {
-      external: [
-        // All Node.js built-in modules (bare and `node:` prefixed)
-        ...builtinModules,
-        ...builtinModules.map((m) => `node:${m}`),
-        // npm dependencies — installed separately, not bundled
-        /^@sctg\//,
-        /^@octokit\//,
-        "dotenv",
-        "js-yaml",
-        "minimatch",
-        "tiktoken",
-        "zod",
-      ],
+      external: (id) => {
+        // Externalize all dependencies that are not relative or absolute paths
+        return !id.startsWith(".") && !id.startsWith("/") && !id.startsWith("\0")
+      },
       output: {
         /**
          * Prepend the shebang so `chmod +x dist/main.mjs` or `npx backport-agent`
@@ -85,5 +75,10 @@ export default defineConfig({
      */
     minify: false,
     sourcemap: true,
+  },
+  resolve: {
+    // Ensure we use the Node.js versions of packages, not the browser versions
+    conditions: ["node", "import"],
+    mainFields: ["module", "main"],
   },
 })
