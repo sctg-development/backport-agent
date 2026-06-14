@@ -20,6 +20,31 @@
 
 import { defineConfig } from "vite"
 import { resolve } from "node:path"
+import { exportCodeForLLM } from "./scripts/export-code-for-llm.js"
+
+/**
+ * Run the LLM export script before building the project.  This ensures that
+ * the `llm.txt` file is up-to-date with the latest code snippets from the
+ * source files.
+ *
+ * If the script fails, the build process will exit with an error code.
+ */
+const runLLMExport = async () => {
+  try {
+    await exportCodeForLLM({
+      outFile: "llm.md",
+      slim: false,
+      maxTokens: Infinity,
+      withIndex: true,
+      verbose: false
+    })
+  } catch (error) {
+    console.error("Échec de l'exécution du script LLM export:", error)
+    process.exit(1)
+  }
+}
+
+await runLLMExport()
 
 /**
  * Vite 8 build configuration for @sctg/backport-agent.
@@ -82,3 +107,4 @@ export default defineConfig({
     mainFields: ["module", "main"],
   },
 })
+

@@ -3,7 +3,7 @@ title: "Backport-agent an ai assistant for backporting"
 description: "An ai assistant for backporting code changes from upstream repositories"
 framework: backport-agent
 stack: "cline sdk"
-generated: "2026-06-13"
+generated: "2026-06-14"
 slim_mode: false
 files_total: 25
 ---
@@ -11,7 +11,7 @@ files_total: 25
 [![Npm package version](https://badgen.net/npm/v/@sctg/backport-agent)](https://npmjs.com/package/@sctg/backport-agent)[![TypeScript](https://badgen.net/badge/icon/typescript?icon=typescript&label)](https://typescriptlang.org)
 # Backport Agent
 
-A deterministic IA powered agent for keeping a heavily customized Git fork in sync with an active upstream repository.
+A deterministic AI-powered agent for keeping a heavily customized Git fork in sync with an active upstream repository.
 
 This project is the implementation of the architecture described in [analysis.md](analysis.md). It is designed for the real-world case where a fork is not just a few patches on top of upstream, but a living codebase with custom providers, build-time rewrites, documentation changes, and operational workflows that must survive every sync.
 
@@ -37,6 +37,16 @@ It is built to support forks that include features such as:
 - build-time package renaming and CI workflow customizations;
 - documentation generation pipelines;
 - a local reporting and validation workflow.
+
+## Key Features
+
+- **Enhanced KeypoolLive Support**: Real-time event handling and token monitoring with comprehensive statistics tracking
+- **Key Usage Reporting**: Detailed Markdown reports showing token usage by model and key
+- **Improved Error Handling**: Enhanced timeout detection and verbose error reporting
+- **Context Compaction**: Automatic conversation history compaction when approaching context limits
+- **HTTP Debugging**: Optional debug fetch wrapper for detailed request/response logging
+- **Benchmark Replay**: Compare different LLM models using existing prompt logs
+- **User-Agent Logging**: Track API requests with detailed user-agent information
 
 ## How it is structured
 
@@ -105,6 +115,12 @@ Set `VERBOSE=true` to see detailed iteration and tool-call progress in stderr:
 VERBOSE=true npm start
 ```
 
+For enhanced HTTP debugging, set `BACKPORT_HTTP_DEBUG=verbose`:
+
+```bash
+BACKPORT_HTTP_DEBUG=verbose npm start
+```
+
 ## Retry behavior
 
 The agent includes automatic retry logic for transient provider errors (rate limits, overloaded endpoints, high-demand responses, HTTP 503, etc.). When a retriable error is detected, the agent waits with exponential backoff (15 s, 30 s, 45 s…) and restarts up to 5 times.
@@ -120,6 +136,34 @@ The iteration counter in verbose output is continuous across retries. A retry is
 --- iteration 17 - Retry 1 ---
 --- iteration 18 - Retry 1 ---
 ```
+
+## Key Usage Reporting
+
+When using the `keypoollive` provider, the agent generates detailed key usage reports showing:
+
+- Tokens by Model ID (input/output/total)
+- Tokens by Key and Model ID
+- Total usage statistics and key rotation events
+
+This provides better visibility into API key usage patterns across different models.
+
+## Context Management
+
+The agent includes sophisticated context management features:
+
+- **Soft Context Limits**: Injects wrap-up signals when approaching token limits
+- **Hard Context Limits**: Aborts runs before context window overflow
+- **Automatic Compaction**: Uses large-context summarizer models to compact conversation history
+- **Context Budget Tracking**: Monitors token usage and provides warnings
+
+## Debugging and Monitoring
+
+Enhanced debugging capabilities are available:
+
+- **HTTP Debug Mode**: Set `BACKPORT_HTTP_DEBUG=verbose` for detailed request/response logging
+- **Timeout Detection**: Automatic detection and enhanced logging for timeout errors
+- **Keypool Event Tracking**: Real-time visibility into key selection, rotation, and exhaustion events
+- **Verbose Stack Traces**: Detailed error information in verbose mode
 
 ## Validation and tests
 
@@ -139,11 +183,99 @@ The main runtime configuration lives in a JSON file modeled after [config.exampl
 - the upstream repository and branch;
 - the fork repository and branch;
 - the working directory;
-- the LLM provider and model selection (`provider`, `fast`, `specialist`, `powerful`);
+- the LLM provider and model selection (`provider`, `fast`, `specialist`, `powerful`, `summarizer`);
 - sync limits and batching;
-- validation tiers.
+- validation tiers;
+- context management parameters.
 
 The `provider` field in the `models` section is required. It accepts any provider ID supported by `@sctg/cline-sdk` (e.g. `"keypoollive"`, `"anthropic"`, `"openai"`, `"mistral"`, `"gemini"`). The API key is resolved from the `apiKey` field, a `$ENV_VAR` reference, or the implicit `{PROVIDER_UPPER}_API_KEY` environment variable.
+
+### `sync.prNumberMatching` — Manual backport detection (optional)
+
+By default, the agent detects already-applied commits using three signals: `git cherry` patch comparison, exact subject-line match, and the `cherry picked from commit <sha>` annotation added by `git cherry-pick -x`.
+
+When a commit is cherry-picked manually (conflict resolution, subject rewrite, no `-x` flag), all three signals can miss it. Enabling `prNumberMatching` adds a fourth signal: if a fork commit references the same upstream PR number **and** the two subjects are similar enough (Jaccard word-token score), the commit is considered already applied.
+
+```json
+"sync": {
+  "prNumberMatching": {
+    "enabled": true,
+    "minSubjectSimilarity": 0.4
+  }
+}
+```
+
+| Field | Default | Description |
+|---|---|---|
+| `enabled` | `false` | Activate PR-number-based duplicate detection. |
+| `minSubjectSimilarity` | `0.4` | Minimum Jaccard word-token similarity (0–1) between the upstream subject and the matching fork subject. Lower → more permissive (risk of false positives). Higher → stricter (may miss heavily reworded backports). |
+
+**Example:** upstream commit `Move \`sdk/apps/\` to \`apps/\` (#11200)` is detected as already applied when the fork contains `feat(backport): Move sdk/apps/ to apps/ (cline#11200)` — the PR number matches and the similarity score (~0.67) exceeds the default threshold.
+
+Enable this only when your team consistently includes the upstream PR number in manual backport commit messages.
+
+### `ai` section — Quality guardrails (optional)
+
+The optional `ai` section configures the AI quality guardrails introduced to improve backport reliability. All fields have safe defaults and the section can be omitted entirely.
+
+```json
+"ai": {
+  "minAutoApplyConfidence": "medium",
+  "requireReviewOnSemanticRisk": false,
+  "enableConflictConsensus": false,
+  "conflictConsensusThreshold": 0.7,
+  "enrichCustomizationContext": true
+}
+```
+
+| Field | Default | Description |
+|---|---|---|
+| `minAutoApplyConfidence` | `"medium"` | Minimum AI confidence level (`"high"` or `"medium"`) to auto-apply a conflict resolution. Use `"high"` for stricter auto-apply. |
+| `requireReviewOnSemanticRisk` | `false` | When `true`, any commit carrying semantic risk factors is escalated to `"review-required"` by `reconcile_ai_assessments`, regardless of the individual AI recommendations. |
+| `enableConflictConsensus` | `false` | **Opt-in.** Runs a second, independent conflict resolution using `config.models.powerful` and compares both outputs with a Dice-coefficient similarity score. If the two resolutions diverge below `conflictConsensusThreshold`, confidence is downgraded to `"low"`. Enabling this roughly doubles LLM cost per conflict. |
+| `conflictConsensusThreshold` | `0.7` | Minimum line-level similarity (0–1) required for consensus. Only used when `enableConflictConsensus: true`. |
+| `enrichCustomizationContext` | `true` | When `true`, `check_customization_compatibility` reads up to 2 source files matching each customization glob (2 000 chars each) and injects their content into the AI prompt for richer analysis. |
+
+### `models.summarizer` — Context compaction (optional)
+
+For long-running sync operations, you can configure a separate large-context model for conversation compaction:
+
+```json
+"models": {
+  "summarizer": {
+    "provider": "anthropic",
+    "modelId": "claude-3-5-sonnet-20240620",
+    "apiKey": "$ANTHROPIC_API_KEY"
+  }
+}
+```
+
+When the conversation history approaches the context limit, the agent automatically uses this model to summarize the progress and continue processing remaining commits.
+
+### AI sub-agent tools
+
+The `src/ai` module exposes four tools that the main agent invokes when deterministic logic is not enough.
+
+| Tool | Type | Purpose |
+|---|---|---|
+| `resolve_conflict_with_ai` | LLM call | Resolves merge conflicts in a single file using the configured `specialist` model. Returns `resolvedContent`, `confidence` (`"high"` / `"medium"` / `"low"`), and `reasoning`. Guards: conflict-marker detection, syntax balance check (JS/TS), optional dual-model consensus. |
+| `analyze_commit_for_backport` | LLM call | Analyzes a commit diff to produce a summary, key changes, complexity estimate, semantic risk factors, and a backport `recommendation`. Also runs hallucination detection on referenced file paths. |
+| `check_customization_compatibility` | LLM call | Checks whether a set of changes is compatible with the fork's declared customizations. Optionally enriches the prompt with actual file content when `ai.enrichCustomizationContext` is enabled. |
+| `reconcile_ai_assessments` | Deterministic | **No LLM call.** Combines the outputs of the two analysis tools into a single `finalRecommendation`. Detects contradictions (e.g. analyze said "apply" but compatibility check failed), applies `requireReviewOnSemanticRisk` escalation, and always resolves ambiguity conservatively. Call this after both analysis tools have run for the same commit. |
+
+Every LLM call is logged to the run's `.prompts.jsonl` file alongside structured quality signals (guards triggered, confidence, hallucination suspects). The detailed report includes a **Decision Quality Metrics** section summarising these signals across the full run.
+
+#### Benchmark replay
+
+The `src/tools/benchmark-replay.ts` script lets you compare two models side-by-side without running a full sync against a real repository. It reads an existing `.prompts.jsonl` log, replays every LLM call with the alternative model, and prints a Markdown comparison report.
+
+```bash
+npx tsx src/tools/benchmark-replay.ts \
+  --log run-1780060224987.prompts.jsonl \
+  --model anthropic/claude-sonnet-4-5 \
+  --provider anthropic \
+  --api-key "$ANTHROPIC_API_KEY" > comparison.md
+```
 
 ### `sync.prNumberMatching` — Manual backport detection (optional)
 
@@ -229,9 +361,36 @@ Contributions are especially welcome in the following areas:
 - better report formatting and human-review summaries;
 - more realistic validation strategies for large forks;
 - documentation improvements and onboarding examples;
-- support for additional providers or model-routing strategies.
+- support for additional providers or model-routing strategies;
+- enhanced context management and compaction strategies;
+- improved key usage reporting and monitoring features;
+- additional debugging and observability tools.
 
 If you are looking for a good first contribution, start with tests or documentation. The project already has a deterministic core, so incremental improvements are easy to verify.
+
+## Recent Improvements
+
+### Version 0.6.1 (Current)
+
+- **Key Usage Reporting**: Added `generateKeyUsageReport()` function for detailed token usage analysis
+- **Enhanced KeypoolLive Support**: Comprehensive event handlers for key selection, rotation, and exhaustion
+- **Improved Error Handling**: Better timeout detection and verbose error reporting
+- **Context Management**: Automatic conversation compaction and context budget tracking
+- **HTTP Debugging**: Optional debug fetch wrapper for detailed API request/response logging (`BACKPORT_HTTP_DEBUG=verbose`)
+- **Configuration Updates**: Added support for summarizer models and enhanced context management
+
+### Version 0.4.0
+
+- **User-Agent Logging**: Improved retry iteration tracking and user-agent logging
+- **Content Truncation**: Added `maxBytes` parameter to `getFileAtRef` for content truncation
+- **File Reference Detection**: Improved file reference detection with customization support
+- **Dependency Updates**: Upgraded all dependencies to latest versions
+
+### Version 0.2.0
+
+- **KeypoolLive Integration**: Full support for vault-based key rotation with real-time monitoring
+- **Enhanced Logging**: Verbose logging and run summary reporting
+- **AWS SDK Updates**: Updated all AWS SDK dependencies to latest versions
 
 ## Design principles
 
@@ -360,6 +519,19 @@ interface AgentSetupParams {
   verbose: boolean
 }
 
+interface KeyUsage {
+  event: string
+  owner: string
+  keyHint: string
+  modelId: string
+  usage?: {
+    input: number
+    output: number
+    cacheRead: number
+    cacheWrite: number
+  }
+}
+
 interface AgentSetupResult {
   /** Factory that creates a fresh Agent for each retry attempt. */
   agentFactory: () => Agent
@@ -371,7 +543,7 @@ interface AgentSetupResult {
     totalCacheWriteTokens: number
     rotations: number
     exhaustions: number
-    keysUsed: Set<string>
+    keysUsed: Set<KeyUsage>
     /** Input token count of the most recent successful LLM call (0 before first call). */
     lastInputTokens: number
   }
@@ -524,8 +696,12 @@ export async function setupAgent(params: AgentSetupParams): Promise<AgentSetupRe
   const riskTool = makeRiskTool(config, customizations) // 1 tool for risk classification
   const validationTool = makeValidationTool(config)     // 1 tool for validation suite
   const githubTools = makeGitHubTools(config)           // 3 tools for GitHub PR management
-  const reportTool = makeReportTool(config, promptLogPath, config.models.provider, resolveApiKey(config)) // 1 terminal tool (completesRun: true)
-  const aiTools = makeAiTools(config, promptLogPath, config.models.provider, resolveApiKey(config), customizations) // 4 AI-powered analysis tools
+  // Pass handleKeypoolEvent so sub-agents (ai-tools, report-tools) have their
+  // token usage tracked in keypoolStats — otherwise only the main agent's calls
+  // appear in the detailed key usage report.
+  const keypoolHandler = config.models.provider === "keypoollive" ? handleKeypoolEvent : undefined
+  const reportTool = makeReportTool(config, promptLogPath, config.models.provider, resolveApiKey(config), keypoolHandler) // 1 terminal tool (completesRun: true)
+  const aiTools = makeAiTools(config, promptLogPath, config.models.provider, resolveApiKey(config), customizations, keypoolHandler) // 4 AI-powered analysis tools
 
   // --- SDK built-in tools ---
   const builtinTools = createBuiltinTools({
@@ -592,7 +768,7 @@ export async function setupAgent(params: AgentSetupParams): Promise<AgentSetupRe
     totalCacheWriteTokens: 0,
     rotations: 0,
     exhaustions: 0,
-    keysUsed: new Set<string>(),
+    keysUsed: new Set<KeyUsage>(),
     lastInputTokens: 0,
   }
 
@@ -612,7 +788,7 @@ export async function setupAgent(params: AgentSetupParams): Promise<AgentSetupRe
           (event.keyOwner ? ` (${event.keyOwner})` : "") +
           ` — ${event.providerName}/${event.modelId}\n`,
         )
-        keypoolStats.keysUsed.add(event.keyHint)
+        keypoolStats.keysUsed.add({ event: event.type, owner: event.keyOwner ?? "(unknown)", keyHint: event.keyHint, modelId: event.modelId })
         break
       case "key-rotated":
         keypoolStats.rotations++
@@ -638,7 +814,7 @@ export async function setupAgent(params: AgentSetupParams): Promise<AgentSetupRe
         keypoolStats.totalOutputTokens += event.outputTokens
         keypoolStats.totalCacheReadTokens += event.cacheReadTokens
         keypoolStats.totalCacheWriteTokens += event.cacheWriteTokens
-        keypoolStats.keysUsed.add(event.keyHint)
+        keypoolStats.keysUsed.add({ event: event.type, owner: event.keyOwner ?? "(unknown)", keyHint: event.keyHint, modelId: event.modelId, usage: { input: event.inputTokens, output: event.outputTokens, cacheRead: event.cacheReadTokens, cacheWrite: event.cacheWriteTokens } })
         keypoolStats.lastInputTokens = event.inputTokens
         // Warn when the main orchestrator context approaches saturation.
         // This fires before the fatal error so the operator can act.
@@ -1857,12 +2033,15 @@ export function checkSyntaxBalance(
   // Strip line comments, block comments, and string/template literals.
   // Template literals are stripped as opaque strings (simplified — does not
   // handle nested template expressions, which is fine for this use-case).
+  // Strip strings BEFORE comments: a "//" inside a string (e.g. URL) must not
+  // be matched by the line-comment regex, which would strip the closing quote
+  // and leave unbalanced braces visible to the counter (false positives).
   const stripped = content
-    .replace(/\/\/[^\n]*/g, "")
-    .replace(/\/\*[\s\S]*?\*\//g, "")
     .replace(/"(?:[^"\\]|\\.)*"/g, '""')
     .replace(/'(?:[^'\\]|\\.)*'/g, "''")
     .replace(/`(?:[^`\\]|\\.)*`/g, "``")
+    .replace(/\/\/[^\n]*/g, "")
+    .replace(/\/\*[\s\S]*?\*\//g, "")
 
   let braces = 0, parens = 0, brackets = 0
   for (const ch of stripped) {
@@ -1940,16 +2119,23 @@ export function detectHallucinatedFileRefs(
   )
 }
 
+// Infer the keypoolEventHandler type from Agent's constructor options so we
+// don't need to import it from @sctg/cline-shared directly.
+type KeypoolEventHandler = NonNullable<Parameters<typeof Agent>[0]> extends
+  { keypoolEventHandler?: (e: infer E) => void } ? ((e: E) => void) : never
+
 /**
  * Creates a minimal sub-`Agent` for a single-turn AI reasoning call.
  *
  * The sub-agent has an empty tools array — it performs a single reasoning turn
  * and returns its text output via `result.outputText`.
  *
- * @param modelId      - Model identifier to use (fast or powerful).
- * @param systemPrompt - System prompt that scopes the sub-agent's behaviour.
- * @param providerId   - LLM provider ID (e.g. `"anthropic"`, `"keypoollive"`).
- * @param apiKey       - Resolved API key (or `undefined` to let the SDK discover it).
+ * @param modelId              - Model identifier to use (fast or powerful).
+ * @param systemPrompt         - System prompt that scopes the sub-agent's behaviour.
+ * @param providerId           - LLM provider ID (e.g. `"anthropic"`, `"keypoollive"`).
+ * @param apiKey               - Resolved API key (or `undefined` to let the SDK discover it).
+ * @param keypoolEventHandler  - Optional keypool event handler forwarded from the main agent
+ *                               so that sub-agent token usage is tracked in keypoolStats.
  * @returns A configured `Agent` instance ready to call `.run(userPrompt)`.
  */
 function makeSubAgent(
@@ -1957,6 +2143,7 @@ function makeSubAgent(
   systemPrompt: string,
   providerId: string,
   apiKey: string | undefined,
+  keypoolEventHandler?: KeypoolEventHandler,
 ): Agent {
   return new Agent({
     providerId,
@@ -1964,6 +2151,7 @@ function makeSubAgent(
     apiKey,
     systemPrompt,
     tools: [],
+    ...(keypoolEventHandler ? { keypoolEventHandler } : {}),
   })
 }
 
@@ -1989,6 +2177,7 @@ export function makeAiTools(
   providerId: string,
   apiKey: string | undefined,
   customizations?: Customizations,
+  keypoolEventHandler?: KeypoolEventHandler,
 ) {
   // -------------------------------------------------------------------------
   // Tool 1: resolve_conflict_with_ai
@@ -2146,7 +2335,7 @@ export function makeAiTools(
           await new Promise((r) => setTimeout(r, 2_000))
         }
         try {
-          const subAgent = makeSubAgent(modelId, systemPrompt, providerId, apiKey)
+          const subAgent = makeSubAgent(modelId, systemPrompt, providerId, apiKey, keypoolEventHandler)
           const t0 = Date.now()
           const result = await subAgent.run(userPrompt)
           const durationMs = Date.now() - t0
@@ -2204,7 +2393,7 @@ export function makeAiTools(
           let consensusFailure = false
           if (config.ai.enableConflictConsensus && label === "specialist" && !hasConflictMarkers) {
             try {
-              const consensusAgent = makeSubAgent(config.models.powerful, systemPrompt, providerId, apiKey)
+              const consensusAgent = makeSubAgent(config.models.powerful, systemPrompt, providerId, apiKey, keypoolEventHandler)
               const ct0 = Date.now()
               const consensusResult = await consensusAgent.run(userPrompt)
               const consensusDurationMs = Date.now() - ct0
@@ -2413,7 +2602,7 @@ export function makeAiTools(
         `Output the JSON object now.`
 
       try {
-        const subAgent = makeSubAgent(analysisModel, systemPrompt, providerId, apiKey)
+        const subAgent = makeSubAgent(analysisModel, systemPrompt, providerId, apiKey, keypoolEventHandler)
         const t0 = Date.now()
         const result = await subAgent.run(userPrompt)
         const durationMs = Date.now() - t0
@@ -2638,7 +2827,7 @@ export function makeAiTools(
         `Output the JSON object now.`
 
       try {
-        const subAgent = makeSubAgent(compatModel, systemPrompt, providerId, apiKey)
+        const subAgent = makeSubAgent(compatModel, systemPrompt, providerId, apiKey, keypoolEventHandler)
         const t0 = Date.now()
         const result = await subAgent.run(userPrompt)
         const durationMs = Date.now() - t0
@@ -5605,6 +5794,116 @@ parseCliArgs()
 }
 
 // ---------------------------------------------------------------------------
+// Key usage reporting functions
+// ---------------------------------------------------------------------------
+
+/**
+ * Generates a detailed key usage report from keypoolStats.
+ * @param keypoolStats - The keypool statistics object
+ * @returns Markdown formatted key usage report
+ */
+function generateKeyUsageReport(keypoolStats: {
+  keysUsed: Set<{
+    event: string
+    owner: string
+    keyHint: string
+    modelId: string
+    usage?: {
+      input: number
+      output: number
+      cacheRead: number
+      cacheWrite: number
+    }
+  }>
+}) {
+  // Filter only usage-recorded events
+  const usageRecords = Array.from(keypoolStats.keysUsed).filter(
+    (usage) => usage.event === "usage-recorded" && usage.usage
+  )
+
+  if (usageRecords.length === 0) {
+    return ""
+  }
+
+  // Calculate tokens by modelId
+  const tokensByModelId = new Map<string, { input: number; output: number; total: number }>()
+  for (const record of usageRecords) {
+    if (record.usage) {
+      const current = tokensByModelId.get(record.modelId) || { input: 0, output: 0, total: 0 }
+      tokensByModelId.set(record.modelId, {
+        input: current.input + record.usage.input,
+        output: current.output + record.usage.output,
+        total: current.total + record.usage.input + record.usage.output
+      })
+    }
+  }
+
+  // Calculate tokens by key and modelId
+  const tokensByKeyAndModelId = new Map<string, Map<string, { input: number; output: number; total: number }>>()
+  for (const record of usageRecords) {
+    if (record.usage) {
+      const keyMap = tokensByKeyAndModelId.get(record.keyHint) || new Map()
+      const current = keyMap.get(record.modelId) || { input: 0, output: 0, total: 0 }
+      keyMap.set(record.modelId, {
+        input: current.input + record.usage.input,
+        output: current.output + record.usage.output,
+        total: current.total + record.usage.input + record.usage.output
+      })
+      tokensByKeyAndModelId.set(record.keyHint, keyMap)
+    }
+  }
+
+  // Generate the report
+  const reportLines: string[] = []
+
+  reportLines.push("## Detailed Key Usage Report")
+  reportLines.push("")
+  reportLines.push("### Tokens by Model ID")
+  reportLines.push("")
+  reportLines.push("| Model ID | Input Tokens | Output Tokens | Total Tokens |")
+  reportLines.push("|---|---|---|---|")
+
+  // Sort by total tokens descending
+  const sortedModels = Array.from(tokensByModelId.entries()).sort(
+    (a, b) => b[1].total - a[1].total
+  )
+
+  for (const [modelId, tokens] of sortedModels) {
+    reportLines.push(
+      `| \`${modelId}\` | ${tokens.input.toLocaleString()} | ${tokens.output.toLocaleString()} | ${tokens.total.toLocaleString()} |`
+    )
+  }
+
+  reportLines.push("")
+  reportLines.push("### Tokens by Key and Model ID")
+  reportLines.push("")
+  reportLines.push("| Key Hint | Model ID | Input Tokens | Output Tokens | Total Tokens |")
+  reportLines.push("|---|---|---|---|---|")
+
+  // Sort keys by total usage descending
+  const sortedKeys = Array.from(tokensByKeyAndModelId.entries()).sort((a, b) => {
+    const totalA = Array.from(a[1].values()).reduce((sum, t) => sum + t.total, 0)
+    const totalB = Array.from(b[1].values()).reduce((sum, t) => sum + t.total, 0)
+    return totalB - totalA
+  })
+
+  for (const [keyHint, modelMap] of sortedKeys) {
+    // Sort models by usage for this key
+    const sortedModelsForKey = Array.from(modelMap.entries()).sort(
+      (a, b) => b[1].total - a[1].total
+    )
+
+    for (const [modelId, tokens] of sortedModelsForKey) {
+      reportLines.push(
+        `| \`${keyHint}\` | \`${modelId}\` | ${tokens.input.toLocaleString()} | ${tokens.output.toLocaleString()} | ${tokens.total.toLocaleString()} |`
+      )
+    }
+  }
+
+  return reportLines.join("\n")
+}
+
+// ---------------------------------------------------------------------------
 // Entry point — async main() is wrapped in .catch() for clean error exit.
 // ---------------------------------------------------------------------------
 
@@ -5739,6 +6038,7 @@ async function main() {
   // --- Run the agent with retry logic ---
   // The agent loop runs until the `generate_report` tool is called
   // (`lifecycle: { completesRun: true }`) or an unrecoverable error occurs.
+  let reportMarkdown: string | null = null
   try {
     const result = await runWithRetry({
       agentFactory,
@@ -5751,7 +6051,6 @@ async function main() {
     if (result.outputText) {
       // The run may complete via generate_report (JSON output) or submit_and_exit (plain text).
       // Try to extract the Markdown report from JSON; fall back to plain text.
-      let reportMarkdown: string
       try {
         const parsedReport = JSON.parse(result.outputText) as { report?: string }
         reportMarkdown = parsedReport.report ?? result.outputText
@@ -5793,6 +6092,13 @@ async function main() {
         process.stderr.write(
           `[Keypool] WARNING: ${keypoolStats.exhaustions} exhaustion event(s) — all keys were rate-limited simultaneously.\n`,
         )
+      }
+
+      // Generate detailed key usage report and append to reportMarkdown
+      if (reportMarkdown) {
+        const keyUsageReport = generateKeyUsageReport(keypoolStats)
+        const updatedReport = reportMarkdown + "\n\n" + keyUsageReport
+        console.log(updatedReport)
       }
     }
   }
@@ -6048,21 +6354,28 @@ function readPromptLog(logPath: string): { prompts: PromptLogEntry[]; auditEvent
   }
 }
 
+// Infer the keypoolEventHandler type from Agent's constructor options.
+type KeypoolEventHandler = NonNullable<Parameters<typeof Agent>[0]> extends
+  { keypoolEventHandler?: (e: infer E) => void } ? ((e: E) => void) : never
+
 /**
  * Instantiates a minimal sub-Agent with no tools for a single reasoning turn.
  * Identical in purpose to the helper in `ai-tools.ts` but local to avoid a
  * cross-module import cycle.
  *
- * @param modelId      - Model identifier to use for the sub-agent.
- * @param systemPrompt - System prompt to inject.
- * @param providerId   - Provider identifier (e.g. `"openai"`, `"anthropic"`).
- * @param apiKey       - API key for the provider, or `undefined` if using env-based auth.
+ * @param modelId             - Model identifier to use for the sub-agent.
+ * @param systemPrompt        - System prompt to inject.
+ * @param providerId          - Provider identifier (e.g. `"openai"`, `"anthropic"`).
+ * @param apiKey              - API key for the provider, or `undefined` if using env-based auth.
+ * @param keypoolEventHandler - Optional keypool event handler forwarded from the main agent
+ *                              so that sub-agent token usage is tracked in keypoolStats.
  */
 function makeReportSubAgent(
   modelId: string,
   systemPrompt: string,
   providerId: string,
   apiKey: string | undefined,
+  keypoolEventHandler?: KeypoolEventHandler,
 ): Agent {
   return new Agent({
     providerId,
@@ -6070,6 +6383,7 @@ function makeReportSubAgent(
     apiKey,
     systemPrompt,
     tools: [],
+    ...(keypoolEventHandler ? { keypoolEventHandler } : {}),
   })
 }
 
@@ -6098,6 +6412,7 @@ async function generateMermaidDiagram(
   runSummary: string,
   providerId: string,
   apiKey: string | undefined,
+  keypoolEventHandler?: KeypoolEventHandler,
 ): Promise<string> {
   const systemPrompt = `You are a technical diagram generator. When given a summary of a Git backport agent run, \
 produce a single Mermaid flowchart (flowchart TD) that visually represents: \
@@ -6114,7 +6429,7 @@ Output ONLY the raw Mermaid code, no prose, no code fence.`
   const userPrompt = `Agent run summary:\n\n${runSummary}\n\nOutput the Mermaid flowchart now.`
 
   try {
-    const subAgent = makeReportSubAgent(config.models.fast, systemPrompt, providerId, apiKey)
+    const subAgent = makeReportSubAgent(config.models.fast, systemPrompt, providerId, apiKey, keypoolEventHandler)
     const result = await subAgent.run(userPrompt)
     const raw = (result.outputText ?? "").trim()
     // Strip any accidental code fence if the model added one.
@@ -6183,6 +6498,7 @@ export function makeReportTool(
   promptLogPath: string,
   providerId: string,
   apiKey: string | undefined,
+  keypoolEventHandler?: KeypoolEventHandler,
 ) {
   return defineTool({
     name: "generate_report",
@@ -6330,7 +6646,7 @@ export function makeReportTool(
         `AI calls: ${readPromptLog(promptLogPath).prompts.map((e) => `${e.tool}(${e.model}, ${e.durationMs}ms)`).join(", ") || "none"}`,
       ].join("\n")
 
-      const mermaidBlock = await generateMermaidDiagram(config, runSummaryForDiagram, providerId, apiKey)
+      const mermaidBlock = await generateMermaidDiagram(config, runSummaryForDiagram, providerId, apiKey, keypoolEventHandler)
 
       // Read and format the prompt log entries.
       const { prompts: promptEntries, auditEvents } = readPromptLog(promptLogPath)

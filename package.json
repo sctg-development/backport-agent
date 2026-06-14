@@ -18,7 +18,9 @@
     "README.md",
     "LICENSE.md",
     "config.example.json",
-    "customizations.example.yaml"
+    "customizations.example.yaml",
+    "llm.md",
+    "llm.txt"
   ],
   "scripts": {
     "start": "tsx src/main.ts",
@@ -32,7 +34,7 @@
   },
   "dependencies": {
     "@octokit/rest": "^22.0.1",
-    "@sctg/cline-sdk": "3.89.2-beta.20260614052455",
+    "@sctg/cline-sdk": "3.89.2-beta.20260614104245",
     "dotenv": "^17.4.2",
     "js-yaml": "^4.2.0",
     "minimatch": "^10.0.1",

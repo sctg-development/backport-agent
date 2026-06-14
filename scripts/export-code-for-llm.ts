@@ -41,6 +41,186 @@ const maxTokens     = maxTokensArg ? parseInt(maxTokensArg.split("=")[1]) : Infi
 const withIndex     = !args.includes("--no-index");
 const verbose       = args.includes("--verbose");
 
+interface ExportOptions {
+    outFile?: string;
+    slim?: boolean;
+    maxTokens?: number;
+    withIndex?: boolean;
+    verbose?: boolean;
+}
+
+/**
+ * Export code for LLM context generation
+ * @param options Export options
+ */
+export async function exportCodeForLLM(options: ExportOptions = {}): Promise<void> {
+    const {
+        outFile: optOutFile = "llm.md",
+        slim: optSlim = false,
+        maxTokens: optMaxTokens = Infinity,
+        withIndex: optWithIndex = true,
+        verbose: optVerbose = false
+    } = options;
+
+    const root = process.cwd();
+
+    let readmeContent = "";
+    try {
+        readmeContent = await fs.readFile(path.join(root, "README.md"), "utf8");
+    } catch {
+        // ignore
+    }
+
+    const patterns = [
+        "src/**/*.{ts,tsx,js,jsx,json}",
+        "apps/merchant/*.sql",
+    ];
+    const ignore = [
+        "**/node_modules/**", "**/dist/**", "**/.next/**", "**/*.d.ts",
+    ];
+
+    const files = await fg(patterns, { cwd: root, absolute: true, onlyFiles: true, ignore });
+
+    type CodeFile = {
+        rel: string; content: string; ext: string;
+        exports: string[];
+    };
+    type ConfigFile = { rel: string; content: string };
+
+    const codeFiles:   CodeFile[]   = [];
+    const configFiles: ConfigFile[] = [];
+
+    for (const abs of files) {
+        const rel = path.relative(root, abs);
+        const ext = path.extname(rel).toLowerCase();
+        const raw = await fs.readFile(abs, "utf8");
+
+        if (ext === ".json") {
+            if (rel.endsWith("package.json")) {
+                try {
+                    const pkg = JSON.parse(raw);
+                    const trimmed = {
+                        name:            pkg.name,
+                        version:         pkg.version,
+                        type:            pkg.type,
+                        dependencies:    pkg.dependencies    ?? {},
+                        devDependencies: Object.fromEntries(
+                            Object.entries(pkg.devDependencies ?? {}).slice(0, 30)
+                        ),
+                    };
+                    configFiles.push({ rel, content: JSON.stringify(trimmed, null, 2) });
+                } catch {
+                    configFiles.push({ rel, content: raw });
+                }
+            } else {
+                configFiles.push({ rel, content: raw });
+            }
+        } else {
+            const content = optSlim ? slimify(raw, ext) : raw;
+            codeFiles.push({
+                rel, content, ext,
+                exports:      extractExports(raw),
+            });
+        }
+    }
+
+    codeFiles.sort((a, b)   => a.rel.localeCompare(b.rel));
+    configFiles.sort((a, b) => a.rel.localeCompare(b.rel));
+
+    const allPaths = [
+        ...codeFiles.map((f)   => f.rel),
+        ...configFiles.map((f) => f.rel),
+    ];
+
+    const now = new Date().toISOString().slice(0, 10);
+    let md = "";
+
+    // YAML front-matter
+    md += `---\n`;
+    md += `title: "Backport-agent an ai assistant for backporting"\n`;
+    md += `description: "An ai assistant for backporting code changes from upstream repositories"\n`;
+    md += `framework: backport-agent\n`;
+    md += `stack: "cline sdk"\n`;
+    md += `generated: "${now}"\n`;
+    md += `slim_mode: ${optSlim}\n`;
+    md += `files_total: ${allPaths.length}\n`;
+    md += `---\n\n`;
+
+    if (readmeContent) {
+        md += readmeContent.trim() + "\n\n---\n\n";
+    }
+
+    md += ARCHITECTURE_PREAMBLE + "\n\n---\n\n";
+
+    const treeLines = buildTree(allPaths);
+    if (treeLines.length) {
+        md += "## Project structure\n\n";
+        md += "```\n" + treeLines.join("\n") + "\n```\n\n";
+    }
+
+    // Source files with per-file metadata
+    if (codeFiles.length) {
+        md += "## Source code\n\n";
+        let tokenCount = estimateTokens(md);
+
+        for (const file of codeFiles) {
+            const lang = languageForExt(file.ext);
+            let section = `### \`${file.rel}\`\n\n`;
+
+            const metaParts: string[] = [];
+            if (file.exports.length)
+                metaParts.push(`**Exports:** ${file.exports.join(", ")}`);
+            if (metaParts.length) section += metaParts.join("  \n") + "\n\n";
+
+            section += "```" + lang + "\n" + file.content +
+                (file.content.endsWith("\n") ? "" : "\n") + "```\n\n";
+
+            const sectionTokens = estimateTokens(section);
+            if (tokenCount + sectionTokens > optMaxTokens) {
+                section = `### \`${file.rel}\`\n\n> _Omitted: token budget reached (--max-tokens=${optMaxTokens})._\n\n`;
+            }
+            tokenCount += sectionTokens;
+            md += section;
+        }
+    }
+
+    // Config files
+    if (configFiles.length) {
+        md += "## Configuration\n\n";
+        for (const f of configFiles) {
+            md += `### \`${f.rel}\`\n\n`;
+            md += "```json\n" + f.content + (f.content.endsWith("\n") ? "" : "\n") + "```\n\n";
+        }
+    }
+
+    await fs.writeFile(optOutFile, md, "utf8");
+    const totalTokens = estimateTokens(md);
+    if (optVerbose) {
+        console.log(
+            `Exported ${allPaths.length} files → ${optOutFile}  (~${totalTokens.toLocaleString()} tokens${optSlim ? ", slim mode" : ""})`
+        );
+
+        console.log(`\nToken breakdown:`);
+        console.log(`  README:       ~${estimateTokens(readmeContent).toLocaleString()}`);
+        console.log(`  Architecture: ~${estimateTokens(ARCHITECTURE_PREAMBLE).toLocaleString()}`);
+        console.log(`  Source code:  ~${estimateTokens(codeFiles.map((f) => f.content).join("")).toLocaleString()}`);
+        console.log(`  Config:       ~${estimateTokens(configFiles.map((f) => f.content).join("")).toLocaleString()}`);
+    }
+
+    if (optWithIndex) {
+        const indexFile = path.join(path.dirname(optOutFile), "llm.txt");
+        let idx = `Backport-agent e-commerce framework — source index (${now})\n`;
+        idx += `Stack: Cline SDK with name @sctg/cline-sdk\n\n`;
+        idx += `FILES\n`;
+        for (const p of allPaths) idx += `  ${p}\n`;
+
+        await fs.writeFile(indexFile, idx, "utf8");
+        if (optVerbose) {
+            console.log(`Index written → ${indexFile}`);
+        }
+    }
+}
+
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 function languageForExt(ext: string): string {
@@ -119,164 +299,13 @@ Backport-Agent is a **AI assisted tool for backporting commits from an upstream 
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 async function main() {
-    const root = process.cwd();
-
-    let readmeContent = "";
-    try {
-        readmeContent = await fs.readFile(path.join(root, "README.md"), "utf8");
-    } catch {
-        // ignore
-    }
-
-    const patterns = [
-        "src/**/*.{ts,tsx,js,jsx,json}",
-        "apps/merchant/*.sql",
-    ];
-    const ignore = [
-        "**/node_modules/**", "**/dist/**", "**/.next/**", "**/*.d.ts",
-    ];
-
-    const files = await fg(patterns, { cwd: root, absolute: true, onlyFiles: true, ignore });
-
-    type CodeFile = {
-        rel: string; content: string; ext: string;
-        exports: string[];
-    };
-    type ConfigFile = { rel: string; content: string };
-
-    const codeFiles:   CodeFile[]   = [];
-    const configFiles: ConfigFile[] = [];
-
-    for (const abs of files) {
-        const rel = path.relative(root, abs);
-        const ext = path.extname(rel).toLowerCase();
-        const raw = await fs.readFile(abs, "utf8");
-
-        if (ext === ".json") {
-            if (rel.endsWith("package.json")) {
-                try {
-                    const pkg = JSON.parse(raw);
-                    const trimmed = {
-                        name:            pkg.name,
-                        version:         pkg.version,
-                        type:            pkg.type,
-                        dependencies:    pkg.dependencies    ?? {},
-                        devDependencies: Object.fromEntries(
-                            Object.entries(pkg.devDependencies ?? {}).slice(0, 30)
-                        ),
-                    };
-                    configFiles.push({ rel, content: JSON.stringify(trimmed, null, 2) });
-                } catch {
-                    configFiles.push({ rel, content: raw });
-                }
-            } else {
-                configFiles.push({ rel, content: raw });
-            }
-        } else {
-            const content = slim ? slimify(raw, ext) : raw;
-            codeFiles.push({
-                rel, content, ext,
-                exports:      extractExports(raw),
-            });
-        }
-    }
-
-    codeFiles.sort((a, b)   => a.rel.localeCompare(b.rel));
-    configFiles.sort((a, b) => a.rel.localeCompare(b.rel));
-
-    const allPaths = [
-        ...codeFiles.map((f)   => f.rel),
-        ...configFiles.map((f) => f.rel),
-    ];
-
-    const now = new Date().toISOString().slice(0, 10);
-    let md = "";
-
-    // YAML front-matter
-    md += `---\n`;
-    md += `title: "Backport-agent an ai assistant for backporting"\n`;
-    md += `description: "An ai assistant for backporting code changes from upstream repositories"\n`;
-    md += `framework: backport-agent\n`;
-    md += `stack: "cline sdk"\n`;
-    md += `generated: "${now}"\n`;
-    md += `slim_mode: ${slim}\n`;
-    md += `files_total: ${allPaths.length}\n`;
-    md += `---\n\n`;
-
-    if (readmeContent) {
-        md += readmeContent.trim() + "\n\n---\n\n";
-    }
-
-    md += ARCHITECTURE_PREAMBLE + "\n\n---\n\n";
-
-    const treeLines = buildTree(allPaths);
-    if (treeLines.length) {
-        md += "## Project structure\n\n";
-        md += "```\n" + treeLines.join("\n") + "\n```\n\n";
-    }
-
-
-    // Source files with per-file metadata
-    if (codeFiles.length) {
-        md += "## Source code\n\n";
-        let tokenCount = estimateTokens(md);
-
-        for (const file of codeFiles) {
-            const lang = languageForExt(file.ext);
-            let section = `### \`${file.rel}\`\n\n`;
-
-            const metaParts: string[] = [];
-            if (file.exports.length)
-                metaParts.push(`**Exports:** ${file.exports.join(", ")}`);
-            if (metaParts.length) section += metaParts.join("  \n") + "\n\n";
-
-            section += "```" + lang + "\n" + file.content +
-                (file.content.endsWith("\n") ? "" : "\n") + "```\n\n";
-
-            const sectionTokens = estimateTokens(section);
-            if (tokenCount + sectionTokens > maxTokens) {
-                section = `### \`${file.rel}\`\n\n> _Omitted: token budget reached (--max-tokens=${maxTokens})._\n\n`;
-            }
-            tokenCount += sectionTokens;
-            md += section;
-        }
-    }
-
-    // Config files
-    if (configFiles.length) {
-        md += "## Configuration\n\n";
-        for (const f of configFiles) {
-            md += `### \`${f.rel}\`\n\n`;
-            md += "```json\n" + f.content + (f.content.endsWith("\n") ? "" : "\n") + "```\n\n";
-        }
-    }
-
-    await fs.writeFile(outFile, md, "utf8");
-    const totalTokens = estimateTokens(md);
-    console.log(
-        `Exported ${allPaths.length} files → ${outFile}  (~${totalTokens.toLocaleString()} tokens${slim ? ", slim mode" : ""})`
-    );
-
-    if (withIndex) {
-
-        const indexFile = path.join(path.dirname(outFile), "llm.txt");
-        let idx = `Backport-agent e-commerce framework — source index (${now})\n`;
-        idx += `Stack: Cline SDK with name @sctg/cline-sdk\n\n`;
-        idx += `FILES\n`;
-        for (const p of allPaths) idx += `  ${p}\n`;
-
-
-        await fs.writeFile(indexFile, idx, "utf8");
-        console.log(`Index written → ${indexFile}`);
-    }
-
-    if (verbose) {
-        console.log(`\nToken breakdown:`);
-        console.log(`  README:       ~${estimateTokens(readmeContent).toLocaleString()}`);
-        console.log(`  Architecture: ~${estimateTokens(ARCHITECTURE_PREAMBLE).toLocaleString()}`);
-        console.log(`  Source code:  ~${estimateTokens(codeFiles.map((f) => f.content).join("")).toLocaleString()}`);
-        console.log(`  Config:       ~${estimateTokens(configFiles.map((f) => f.content).join("")).toLocaleString()}`);
-    }
+    await exportCodeForLLM({
+        outFile: outFile,
+        slim: slim,
+        maxTokens: maxTokens,
+        withIndex: withIndex,
+        verbose: verbose
+    });
 }
 
 main().catch((err) => {
