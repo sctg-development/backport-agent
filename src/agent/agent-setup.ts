@@ -41,7 +41,14 @@ import { buildSystemPrompt } from "./system-prompt.js"
 import { resolveApiKey } from "../config/provider.js"
 import { compactConversation, getSummarizerConfig } from "./context-compaction.js"
 import { Tiktoken } from "tiktoken/lite"
-import cl100k_base from "tiktoken/encoders/cl100k_base.json" with { type: "json" }
+// Charger le JSON de manière synchrone compatible avec Bun
+import { createRequire } from 'node:module'
+import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
+
+const require = createRequire(import.meta.url)
+const tiktokenPath = require.resolve("tiktoken/encoders/cl100k_base.json")
+const cl100k_base = JSON.parse(readFileSync(tiktokenPath, 'utf-8'))
 
 
 interface AgentSetupParams {
