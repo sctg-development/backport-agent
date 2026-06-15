@@ -1,6 +1,6 @@
 {
   "name": "@sctg/backport-agent",
-  "version": "0.6.2",
+  "version": "0.6.3",
   "description": "Generic fork sync & preservation agent powered by @sctg/cline-sdk",
   "type": "module",
   "engines": {
