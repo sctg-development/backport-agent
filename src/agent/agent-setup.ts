@@ -308,6 +308,7 @@ export async function setupAgent(params: AgentSetupParams): Promise<AgentSetupRe
     exhaustions: 0,
     keysUsed: new Set<KeyUsage>(),
     lastInputTokens: 0,
+    lastCacheReadTokens: 0,
   }
 
   // Infer KeypoolEvent type from Agent constructor to avoid a direct import from @sctg/cline-shared.
@@ -354,12 +355,16 @@ export async function setupAgent(params: AgentSetupParams): Promise<AgentSetupRe
         keypoolStats.totalCacheWriteTokens += event.cacheWriteTokens
         keypoolStats.keysUsed.add({ event: event.type, owner: event.keyOwner ?? "(unknown)", keyHint: event.keyHint, modelId: event.modelId, usage: { input: event.inputTokens, output: event.outputTokens, cacheRead: event.cacheReadTokens, cacheWrite: event.cacheWriteTokens } })
         keypoolStats.lastInputTokens = event.inputTokens
+        keypoolStats.lastCacheReadTokens = event.cacheReadTokens
         // Warn when the main orchestrator context approaches saturation.
-        // This fires before the fatal error so the operator can act.
-        if (event.inputTokens > 150_000) {
+        // Track total context (billed input + cache-read) because cached tokens
+        // still occupy the context window and count toward the model limit.
+        const totalContext = event.inputTokens + event.cacheReadTokens
+        if (totalContext > 150_000) {
           process.stderr.write(
-            `[Context] WARNING: ~${Math.round(event.inputTokens / 1000)}k tokens in context` +
-            ` (model limit ~262k) — consider lowering maxCommitsPerRun\n`,
+            `[Context] WARNING: ~${Math.round(totalContext / 1000)}k tokens in context` +
+            ` (${Math.round(event.inputTokens / 1000)}k new + ${Math.round(event.cacheReadTokens / 1000)}k cached,` +
+            ` model limit ~262k) — consider lowering maxCommitsPerRun\n`,
           )
         }
         if (verbose) {
@@ -400,10 +405,10 @@ export async function setupAgent(params: AgentSetupParams): Promise<AgentSetupRe
       // Wire keypoollive event callbacks to get visibility into key rotation and usage.
       ...(config.models.provider === "keypoollive" ? { keypoolEventHandler: handleKeypoolEvent } : {}),
       // Soft context guard: inject a one-time "wrap up NOW" user message when the previous
-      // model call consumed more than softLimit tokens.  This gives the model a chance to
-      // call generate_report gracefully before the hard abort fires.
+      // model call consumed more than softLimit tokens.  Track total context (billed input +
+      // cache-read) because cached tokens still occupy the context window.
       consumePendingUserMessage: () => {
-        const tokens = keypoolStats.lastInputTokens
+        const tokens = keypoolStats.lastInputTokens + keypoolStats.lastCacheReadTokens
         if (tokens >= softLimit && !contextWrapupSent) {
           contextWrapupSent = true
           process.stderr.write(
@@ -424,7 +429,7 @@ export async function setupAgent(params: AgentSetupParams): Promise<AgentSetupRe
       // it is treated as non-retriable (retrying would only recreate the same overflow).
       hooks: {
         beforeModel: async () => {
-          const tokens = keypoolStats.lastInputTokens
+          const tokens = keypoolStats.lastInputTokens + keypoolStats.lastCacheReadTokens
           if (tokens >= hardLimit) {
             process.stderr.write(
               `[Context] Hard limit reached (~${Math.round(tokens / 1000)}k tokens ≥ ${Math.round(hardLimit / 1000)}k), aborting run to prevent context window overflow\n`,
@@ -443,7 +448,7 @@ export async function setupAgent(params: AgentSetupParams): Promise<AgentSetupRe
       // the in-memory transcript (unlike beforeModel which applies for one turn only), so the
       // agent continues processing remaining commits with a fresh ~15k context budget.
       prepareTurn: async ({ messages, systemPrompt }: PrepareTurnContext) => {
-        const tokens = keypoolStats.lastInputTokens
+        const tokens = keypoolStats.lastInputTokens + keypoolStats.lastCacheReadTokens
         if (tokens < config.sync.compactionThreshold) return undefined
 
         const { providerId: sProvider, modelId: sModel, apiKey: sKey } = getSummarizerConfig(config)

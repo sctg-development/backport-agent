@@ -273,6 +273,28 @@ export const SyncConfigSchema = z.object({
         .boolean()
         .default(true)
         .describe("Delete the sync branch after a successful auto-merge"),
+
+      /**
+       * Maximum number of characters returned per version (forkVersion / upstreamVersion /
+       * withMarkers) by the `get_conflict_context` tool.
+       *
+       * For large auto-generated files (e.g. model catalogs, lock files) returning the full
+       * content of all three versions can exceed the model's context window in a single tool
+       * result.  When any version exceeds this limit, `get_conflict_context` extracts only the
+       * conflict-marker regions (with surrounding context lines) from `withMarkers`, and the
+       * corresponding line ranges from `forkVersion` / `upstreamVersion`, falling back to a
+       * head-truncation if line mapping is impractical.
+       *
+       * Set to a higher value if the agent frequently lacks enough context to resolve conflicts
+       * correctly; lower it if context-window overflows persist.
+       * Defaults to `60_000` (~15k tokens per version, ~45k total for all three).
+       */
+      maxConflictContextChars: z
+        .number()
+        .int()
+        .positive()
+        .default(60_000)
+        .describe("Max chars per version returned by get_conflict_context (prevents context-window overflow for large files)"),
     })
     // Allow omitting the entire sync block in config.json; each field has its own default.
     .default(() => ({} as any)),

@@ -105,6 +105,74 @@ function matchesResolvePattern(filePath: string, patterns: string[]): boolean {
  */
 export const CHECKPOINT_FILENAME = ".backport-checkpoint.json"
 
+/**
+ * Extracts conflict-marker regions from a file with `<<<<<<<` markers, keeping
+ * `contextLines` lines of surrounding context on each side of every block.
+ * Adjacent or overlapping windows are merged.  Non-adjacent omitted sections are
+ * replaced with a `[... N lines omitted ...]` separator so the model knows content
+ * was dropped.  Returns the original string unchanged when no markers are found or
+ * the result would exceed `maxChars`.
+ */
+function extractConflictRegions(content: string, maxChars: number, contextLines = 50): string {
+  const lines = content.split("\n")
+  if (content.length <= maxChars) return content
+
+  // Identify line ranges that contain conflict markers.
+  const conflictLineIndices: number[] = []
+  for (let i = 0; i < lines.length; i++) {
+    const trimmed = lines[i].trimStart()
+    if (trimmed.startsWith("<<<<<<<") || trimmed.startsWith("=======") || trimmed.startsWith(">>>>>>>")) {
+      conflictLineIndices.push(i)
+    }
+  }
+
+  if (conflictLineIndices.length === 0) {
+    // No markers — return head-truncated with a note.
+    const truncated = content.slice(0, maxChars)
+    return truncated + `\n[... file truncated: ${content.length - maxChars} chars omitted (no conflict markers found) ...]`
+  }
+
+  // Build merged windows: [start, end] inclusive line index pairs.
+  const windows: Array<[number, number]> = []
+  for (const idx of conflictLineIndices) {
+    const start = Math.max(0, idx - contextLines)
+    const end = Math.min(lines.length - 1, idx + contextLines)
+    if (windows.length > 0 && start <= windows[windows.length - 1][1] + 1) {
+      // Merge with previous window.
+      windows[windows.length - 1][1] = Math.max(windows[windows.length - 1][1], end)
+    } else {
+      windows.push([start, end])
+    }
+  }
+
+  // Assemble result from windows, inserting omission notes between them.
+  const parts: string[] = []
+  let prevEnd = -1
+  for (const [start, end] of windows) {
+    if (prevEnd === -1 && start > 0) {
+      parts.push(`[... ${start} lines omitted ...]`)
+    } else if (prevEnd >= 0 && start > prevEnd + 1) {
+      parts.push(`[... ${start - prevEnd - 1} lines omitted ...]`)
+    }
+    parts.push(lines.slice(start, end + 1).join("\n"))
+    prevEnd = end
+  }
+  if (prevEnd < lines.length - 1) {
+    parts.push(`[... ${lines.length - 1 - prevEnd} lines omitted ...]`)
+  }
+
+  return parts.join("\n")
+}
+
+/**
+ * Truncates a clean file version (no conflict markers) to `maxChars` characters,
+ * appending a note about how many characters were omitted.
+ */
+function truncateCleanVersion(content: string, maxChars: number): string {
+  if (content.length <= maxChars) return content
+  return content.slice(0, maxChars) + `\n[... ${content.length - maxChars} chars omitted — file too large for context window ...]`
+}
+
 export function makeGitTools(config: SyncConfig) {
   // Destructure frequently-used config sections for brevity inside each tool.
   const { workingDir, upstream, fork, sync } = config
@@ -331,16 +399,16 @@ export function makeGitTools(config: SyncConfig) {
     }),
     execute: async ({ filePath }) => {
       // Fetch the fork's current committed version (may be null for new files).
-      const forkVersion = getFileAtRef(workingDir, "HEAD", filePath)
+      const rawForkVersion = getFileAtRef(workingDir, "HEAD", filePath)
       // Fetch the incoming upstream version (may be null for deleted files).
-      const upstreamVersion = getFileAtRef(workingDir, "CHERRY_PICK_HEAD", filePath)
+      const rawUpstreamVersion = getFileAtRef(workingDir, "CHERRY_PICK_HEAD", filePath)
       // Read the working-tree file which contains conflict markers.
-      let withMarkers: string | null = null
+      let rawWithMarkers: string | null = null
       try {
-        withMarkers = readFileSync(`${workingDir}/${filePath}`, "utf-8")
+        rawWithMarkers = readFileSync(`${workingDir}/${filePath}`, "utf-8")
       } catch {
         // The file may have been deleted by the upstream commit.
-        withMarkers = null
+        rawWithMarkers = null
       }
 
       // Deterministic strategy override from config.resolve.
@@ -355,7 +423,28 @@ export function makeGitTools(config: SyncConfig) {
         }
       }
 
-      return { filePath, forkVersion, upstreamVersion, withMarkers, forcedStrategy }
+      // Apply per-version character limits to prevent context-window overflow for
+      // large auto-generated files (e.g. model catalogs, lock files).
+      // withMarkers is truncated by extracting only the conflict-marker regions
+      // (with surrounding context lines); forkVersion / upstreamVersion are
+      // head-truncated since they have no markers to guide extraction.
+      const maxChars = sync.maxConflictContextChars
+      const forkVersion = rawForkVersion !== null ? truncateCleanVersion(rawForkVersion, maxChars) : null
+      const upstreamVersion = rawUpstreamVersion !== null ? truncateCleanVersion(rawUpstreamVersion, maxChars) : null
+      const withMarkers = rawWithMarkers !== null ? extractConflictRegions(rawWithMarkers, maxChars) : null
+
+      const truncated =
+        (rawForkVersion !== null && forkVersion !== rawForkVersion) ||
+        (rawUpstreamVersion !== null && upstreamVersion !== rawUpstreamVersion) ||
+        (rawWithMarkers !== null && withMarkers !== rawWithMarkers)
+
+      if (truncated) {
+        process.stderr.write(
+          `[Context] get_conflict_context: truncated large file "${filePath}" to ${maxChars} chars/version\n`,
+        )
+      }
+
+      return { filePath, forkVersion, upstreamVersion, withMarkers, forcedStrategy, truncated }
     },
   })
 
