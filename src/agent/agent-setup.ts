@@ -461,6 +461,10 @@ export async function setupAgent(params: AgentSetupParams): Promise<AgentSetupRe
           return undefined
         }
         process.stderr.write(`[Context] Compaction done: ${messages.length} → ${compacted.length} messages\n`)
+        // Reset stale per-call token stats so beforeModel doesn't abort based on pre-compaction
+        // values. The next model call will record fresh stats via the keypool "usage-recorded" event.
+        keypoolStats.lastInputTokens = 0
+        keypoolStats.lastCacheReadTokens = 0
         return { messages: compacted }
       },
     })

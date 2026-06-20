@@ -34,7 +34,7 @@
   },
   "dependencies": {
     "@octokit/rest": "^22.0.1",
-    "@sctg/cline-sdk": "3.89.2-beta.20260617053820",
+    "@sctg/cline-sdk": "3.89.2-beta.20260620061932",
     "dotenv": "^17.4.2",
     "js-yaml": "^4.2.0",
     "minimatch": "^10.0.1",
@@ -43,7 +43,7 @@
   },
   "devDependencies": {
     "@types/js-yaml": "^4.0.9",
-    "@types/node": "^22.19.19",
+    "@types/node": "^22.20.0",
     "fast-glob": "^3.3.3",
     "tsx": "^4.22.4",
     "typescript": "^6.0.3",

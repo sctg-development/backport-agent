@@ -3,9 +3,9 @@ title: "Backport-agent an ai assistant for backporting"
 description: "An ai assistant for backporting code changes from upstream repositories"
 framework: backport-agent
 stack: "cline sdk"
-generated: "2026-06-14"
+generated: "2026-06-20"
 slim_mode: false
-files_total: 25
+files_total: 26
 ---
 
 [![Npm package version](https://badgen.net/npm/v/@sctg/backport-agent)](https://npmjs.com/package/@sctg/backport-agent)[![TypeScript](https://badgen.net/badge/icon/typescript?icon=typescript&label)](https://typescriptlang.org)
@@ -447,6 +447,7 @@ Backport-Agent is a **AI assisted tool for backporting commits from an upstream 
    │  └─ github-tools.ts
    ├─ main.ts
    ├─ reports
+   │  ├─ context-abort-report.ts
    │  ├─ noop-report.ts
    │  └─ report-tools.ts
    ├─ risk
@@ -510,7 +511,14 @@ import { buildSystemPrompt } from "./system-prompt.js"
 import { resolveApiKey } from "../config/provider.js"
 import { compactConversation, getSummarizerConfig } from "./context-compaction.js"
 import { Tiktoken } from "tiktoken/lite"
-import cl100k_base from "tiktoken/encoders/cl100k_base.json" with { type: "json" }
+// Charger le JSON de manière synchrone compatible avec Bun
+import { createRequire } from 'node:module'
+import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
+
+const require = createRequire(import.meta.url)
+const tiktokenPath = require.resolve("tiktoken/encoders/cl100k_base.json")
+const cl100k_base = JSON.parse(readFileSync(tiktokenPath, 'utf-8'))
 
 
 interface AgentSetupParams {
@@ -770,6 +778,7 @@ export async function setupAgent(params: AgentSetupParams): Promise<AgentSetupRe
     exhaustions: 0,
     keysUsed: new Set<KeyUsage>(),
     lastInputTokens: 0,
+    lastCacheReadTokens: 0,
   }
 
   // Infer KeypoolEvent type from Agent constructor to avoid a direct import from @sctg/cline-shared.
@@ -816,12 +825,16 @@ export async function setupAgent(params: AgentSetupParams): Promise<AgentSetupRe
         keypoolStats.totalCacheWriteTokens += event.cacheWriteTokens
         keypoolStats.keysUsed.add({ event: event.type, owner: event.keyOwner ?? "(unknown)", keyHint: event.keyHint, modelId: event.modelId, usage: { input: event.inputTokens, output: event.outputTokens, cacheRead: event.cacheReadTokens, cacheWrite: event.cacheWriteTokens } })
         keypoolStats.lastInputTokens = event.inputTokens
+        keypoolStats.lastCacheReadTokens = event.cacheReadTokens
         // Warn when the main orchestrator context approaches saturation.
-        // This fires before the fatal error so the operator can act.
-        if (event.inputTokens > 150_000) {
+        // Track total context (billed input + cache-read) because cached tokens
+        // still occupy the context window and count toward the model limit.
+        const totalContext = event.inputTokens + event.cacheReadTokens
+        if (totalContext > 150_000) {
           process.stderr.write(
-            `[Context] WARNING: ~${Math.round(event.inputTokens / 1000)}k tokens in context` +
-            ` (model limit ~262k) — consider lowering maxCommitsPerRun\n`,
+            `[Context] WARNING: ~${Math.round(totalContext / 1000)}k tokens in context` +
+            ` (${Math.round(event.inputTokens / 1000)}k new + ${Math.round(event.cacheReadTokens / 1000)}k cached,` +
+            ` model limit ~262k) — consider lowering maxCommitsPerRun\n`,
           )
         }
         if (verbose) {
@@ -862,10 +875,10 @@ export async function setupAgent(params: AgentSetupParams): Promise<AgentSetupRe
       // Wire keypoollive event callbacks to get visibility into key rotation and usage.
       ...(config.models.provider === "keypoollive" ? { keypoolEventHandler: handleKeypoolEvent } : {}),
       // Soft context guard: inject a one-time "wrap up NOW" user message when the previous
-      // model call consumed more than softLimit tokens.  This gives the model a chance to
-      // call generate_report gracefully before the hard abort fires.
+      // model call consumed more than softLimit tokens.  Track total context (billed input +
+      // cache-read) because cached tokens still occupy the context window.
       consumePendingUserMessage: () => {
-        const tokens = keypoolStats.lastInputTokens
+        const tokens = keypoolStats.lastInputTokens + keypoolStats.lastCacheReadTokens
         if (tokens >= softLimit && !contextWrapupSent) {
           contextWrapupSent = true
           process.stderr.write(
@@ -886,7 +899,7 @@ export async function setupAgent(params: AgentSetupParams): Promise<AgentSetupRe
       // it is treated as non-retriable (retrying would only recreate the same overflow).
       hooks: {
         beforeModel: async () => {
-          const tokens = keypoolStats.lastInputTokens
+          const tokens = keypoolStats.lastInputTokens + keypoolStats.lastCacheReadTokens
           if (tokens >= hardLimit) {
             process.stderr.write(
               `[Context] Hard limit reached (~${Math.round(tokens / 1000)}k tokens ≥ ${Math.round(hardLimit / 1000)}k), aborting run to prevent context window overflow\n`,
@@ -905,7 +918,7 @@ export async function setupAgent(params: AgentSetupParams): Promise<AgentSetupRe
       // the in-memory transcript (unlike beforeModel which applies for one turn only), so the
       // agent continues processing remaining commits with a fresh ~15k context budget.
       prepareTurn: async ({ messages, systemPrompt }: PrepareTurnContext) => {
-        const tokens = keypoolStats.lastInputTokens
+        const tokens = keypoolStats.lastInputTokens + keypoolStats.lastCacheReadTokens
         if (tokens < config.sync.compactionThreshold) return undefined
 
         const { providerId: sProvider, modelId: sModel, apiKey: sKey } = getSummarizerConfig(config)
@@ -918,6 +931,10 @@ export async function setupAgent(params: AgentSetupParams): Promise<AgentSetupRe
           return undefined
         }
         process.stderr.write(`[Context] Compaction done: ${messages.length} → ${compacted.length} messages\n`)
+        // Reset stale per-call token stats so beforeModel doesn't abort based on pre-compaction
+        // values. The next model call will record fresh stats via the keypool "usage-recorded" event.
+        keypoolStats.lastInputTokens = 0
+        keypoolStats.lastCacheReadTokens = 0
         return { messages: compacted }
       },
     })
@@ -3580,6 +3597,28 @@ export const SyncConfigSchema = z.object({
         .boolean()
         .default(true)
         .describe("Delete the sync branch after a successful auto-merge"),
+
+      /**
+       * Maximum number of characters returned per version (forkVersion / upstreamVersion /
+       * withMarkers) by the `get_conflict_context` tool.
+       *
+       * For large auto-generated files (e.g. model catalogs, lock files) returning the full
+       * content of all three versions can exceed the model's context window in a single tool
+       * result.  When any version exceeds this limit, `get_conflict_context` extracts only the
+       * conflict-marker regions (with surrounding context lines) from `withMarkers`, and the
+       * corresponding line ranges from `forkVersion` / `upstreamVersion`, falling back to a
+       * head-truncation if line mapping is impractical.
+       *
+       * Set to a higher value if the agent frequently lacks enough context to resolve conflicts
+       * correctly; lower it if context-window overflows persist.
+       * Defaults to `60_000` (~15k tokens per version, ~45k total for all three).
+       */
+      maxConflictContextChars: z
+        .number()
+        .int()
+        .positive()
+        .default(60_000)
+        .describe("Max chars per version returned by get_conflict_context (prevents context-window overflow for large files)"),
     })
     // Allow omitting the entire sync block in config.json; each field has its own default.
     .default(() => ({} as any)),
@@ -5046,6 +5085,74 @@ function matchesResolvePattern(filePath: string, patterns: string[]): boolean {
  */
 export const CHECKPOINT_FILENAME = ".backport-checkpoint.json"
 
+/**
+ * Extracts conflict-marker regions from a file with `<<<<<<<` markers, keeping
+ * `contextLines` lines of surrounding context on each side of every block.
+ * Adjacent or overlapping windows are merged.  Non-adjacent omitted sections are
+ * replaced with a `[... N lines omitted ...]` separator so the model knows content
+ * was dropped.  Returns the original string unchanged when no markers are found or
+ * the result would exceed `maxChars`.
+ */
+function extractConflictRegions(content: string, maxChars: number, contextLines = 50): string {
+  const lines = content.split("\n")
+  if (content.length <= maxChars) return content
+
+  // Identify line ranges that contain conflict markers.
+  const conflictLineIndices: number[] = []
+  for (let i = 0; i < lines.length; i++) {
+    const trimmed = lines[i].trimStart()
+    if (trimmed.startsWith("<<<<<<<") || trimmed.startsWith("=======") || trimmed.startsWith(">>>>>>>")) {
+      conflictLineIndices.push(i)
+    }
+  }
+
+  if (conflictLineIndices.length === 0) {
+    // No markers — return head-truncated with a note.
+    const truncated = content.slice(0, maxChars)
+    return truncated + `\n[... file truncated: ${content.length - maxChars} chars omitted (no conflict markers found) ...]`
+  }
+
+  // Build merged windows: [start, end] inclusive line index pairs.
+  const windows: Array<[number, number]> = []
+  for (const idx of conflictLineIndices) {
+    const start = Math.max(0, idx - contextLines)
+    const end = Math.min(lines.length - 1, idx + contextLines)
+    if (windows.length > 0 && start <= windows[windows.length - 1][1] + 1) {
+      // Merge with previous window.
+      windows[windows.length - 1][1] = Math.max(windows[windows.length - 1][1], end)
+    } else {
+      windows.push([start, end])
+    }
+  }
+
+  // Assemble result from windows, inserting omission notes between them.
+  const parts: string[] = []
+  let prevEnd = -1
+  for (const [start, end] of windows) {
+    if (prevEnd === -1 && start > 0) {
+      parts.push(`[... ${start} lines omitted ...]`)
+    } else if (prevEnd >= 0 && start > prevEnd + 1) {
+      parts.push(`[... ${start - prevEnd - 1} lines omitted ...]`)
+    }
+    parts.push(lines.slice(start, end + 1).join("\n"))
+    prevEnd = end
+  }
+  if (prevEnd < lines.length - 1) {
+    parts.push(`[... ${lines.length - 1 - prevEnd} lines omitted ...]`)
+  }
+
+  return parts.join("\n")
+}
+
+/**
+ * Truncates a clean file version (no conflict markers) to `maxChars` characters,
+ * appending a note about how many characters were omitted.
+ */
+function truncateCleanVersion(content: string, maxChars: number): string {
+  if (content.length <= maxChars) return content
+  return content.slice(0, maxChars) + `\n[... ${content.length - maxChars} chars omitted — file too large for context window ...]`
+}
+
 export function makeGitTools(config: SyncConfig) {
   // Destructure frequently-used config sections for brevity inside each tool.
   const { workingDir, upstream, fork, sync } = config
@@ -5272,16 +5379,16 @@ export function makeGitTools(config: SyncConfig) {
     }),
     execute: async ({ filePath }) => {
       // Fetch the fork's current committed version (may be null for new files).
-      const forkVersion = getFileAtRef(workingDir, "HEAD", filePath)
+      const rawForkVersion = getFileAtRef(workingDir, "HEAD", filePath)
       // Fetch the incoming upstream version (may be null for deleted files).
-      const upstreamVersion = getFileAtRef(workingDir, "CHERRY_PICK_HEAD", filePath)
+      const rawUpstreamVersion = getFileAtRef(workingDir, "CHERRY_PICK_HEAD", filePath)
       // Read the working-tree file which contains conflict markers.
-      let withMarkers: string | null = null
+      let rawWithMarkers: string | null = null
       try {
-        withMarkers = readFileSync(`${workingDir}/${filePath}`, "utf-8")
+        rawWithMarkers = readFileSync(`${workingDir}/${filePath}`, "utf-8")
       } catch {
         // The file may have been deleted by the upstream commit.
-        withMarkers = null
+        rawWithMarkers = null
       }
 
       // Deterministic strategy override from config.resolve.
@@ -5296,7 +5403,28 @@ export function makeGitTools(config: SyncConfig) {
         }
       }
 
-      return { filePath, forkVersion, upstreamVersion, withMarkers, forcedStrategy }
+      // Apply per-version character limits to prevent context-window overflow for
+      // large auto-generated files (e.g. model catalogs, lock files).
+      // withMarkers is truncated by extracting only the conflict-marker regions
+      // (with surrounding context lines); forkVersion / upstreamVersion are
+      // head-truncated since they have no markers to guide extraction.
+      const maxChars = sync.maxConflictContextChars
+      const forkVersion = rawForkVersion !== null ? truncateCleanVersion(rawForkVersion, maxChars) : null
+      const upstreamVersion = rawUpstreamVersion !== null ? truncateCleanVersion(rawUpstreamVersion, maxChars) : null
+      const withMarkers = rawWithMarkers !== null ? extractConflictRegions(rawWithMarkers, maxChars) : null
+
+      const truncated =
+        (rawForkVersion !== null && forkVersion !== rawForkVersion) ||
+        (rawUpstreamVersion !== null && upstreamVersion !== rawUpstreamVersion) ||
+        (rawWithMarkers !== null && withMarkers !== rawWithMarkers)
+
+      if (truncated) {
+        process.stderr.write(
+          `[Context] get_conflict_context: truncated large file "${filePath}" to ${maxChars} chars/version\n`,
+        )
+      }
+
+      return { filePath, forkVersion, upstreamVersion, withMarkers, forcedStrategy, truncated }
     },
   })
 
@@ -5771,11 +5899,38 @@ import { loadConfig } from "./config/loader.js"
 import { applyGitAuth, ensureWorkingDir } from "./git/git-init.js"
 import { ensureMergeBase, fetchRemotes, listCandidateCommits } from "./git/git-client.js"
 import { buildNoopSyncReport } from "./reports/noop-report.js"
+import { buildContextAbortReport } from "./reports/context-abort-report.js"
 import { setupAgent } from "./agent/agent-setup.js"
 import { setupEventHandlers } from "./agent/event-handlers.js"
 import { runWithRetry } from "./agent/retry-logic.js"
 import { CHECKPOINT_FILENAME } from "./git/git-tools.js"
 import type { SyncConfig } from "./config/schema.js"
+
+/**
+ * Gets the sync branch name from the checkpoint file if available, otherwise generates
+ * a fallback branch name using the same pattern as createSyncBranchTool.
+ *
+ * @param config - The sync configuration
+ * @returns The sync branch name
+ */
+function getSyncBranchNameFromCheckpoint(config: SyncConfig): string {
+  const checkpointPath = joinPath(config.workingDir, CHECKPOINT_FILENAME)
+  if (existsSync(checkpointPath)) {
+    try {
+      const checkpoint = JSON.parse(readFileSync(checkpointPath, "utf8"))
+      if (checkpoint.syncBranch) {
+        return checkpoint.syncBranch
+      }
+    } catch {
+      // Silently fall through to default
+    }
+  }
+  // Default fallback - matches the pattern used in createSyncBranchTool
+  const now = new Date()
+  const date = now.toISOString().slice(0, 10)
+  const time = now.toISOString().slice(11, 19).replace(/:/g, "")
+  return `${config.sync.branchPrefix}${config.upstream.branch}-${date}-${time}`
+}
 
 // ---------------------------------------------------------------------------
 // CLI argument parsing — runs before .env loading so flags can override env.
@@ -6061,17 +6216,48 @@ async function main() {
       console.log(reportMarkdown)
       if (verbose) {
         // Shows a one line command for merging the new branch in the terminal, if the report contains a new branch to merge.
+        const syncBranchName = getSyncBranchNameFromCheckpoint(config)
         const commandLine = `# Sample merge command:
   pushd ${config.workingDir}
-     git checkout ${config.fork.branch}
-     git merge ${upstreamRef}
-     git push
+     git checkout ${config.fork.branch} && git merge ${syncBranchName} && git branch -D ${syncBranchName} && git push
   popd`
         console.log(commandLine)
       }
     } else {
       // With requireCompletionTool: true this should never happen on a clean run.
       throw new Error("Agent run completed but generate_report was never called (empty output). Check the prompt log for details.")
+    }
+  } catch (runErr) {
+    // Safety net: if the run was aborted due to the context window hard limit AND a
+    // checkpoint file exists, generate a partial report instead of crashing with exit 1.
+    // Correctif A (reset of lastInputTokens after compaction) should prevent this path in
+    // most cases, but this guard handles any remaining edge cases.
+    const msg = runErr instanceof Error ? runErr.message : String(runErr)
+    const isContextAbort = /context window limit|aborted/i.test(msg)
+    if (isContextAbort && existsSync(checkpointPath)) {
+      try {
+        const cp = JSON.parse(readFileSync(checkpointPath, "utf8")) as {
+          syncBranch?: string
+          appliedShas?: string[]
+          timestamp?: string
+        }
+        reportMarkdown = buildContextAbortReport({
+          upstreamRef,
+          forkRef,
+          appliedShas: cp.appliedShas ?? [],
+          syncBranch: cp.syncBranch ?? "(not created)",
+          pendingCommits,
+          dryRun: config.sync.dryRun,
+        })
+        console.error(`\n=== Run complete (context-limit abort) ===\n`)
+        console.error("[Context] Run aborted due to context limit — partial report generated; checkpoint preserved for next run.")
+        console.log(reportMarkdown)
+      } catch {
+        // If partial report generation fails, re-throw the original abort error.
+        throw runErr
+      }
+    } else {
+      throw runErr
     }
   } finally {
     userInstructionService.stop()
@@ -6143,6 +6329,105 @@ main()
 
     process.exit(1)
   })
+```
+
+### `src/reports/context-abort-report.ts`
+
+**Exports:** buildContextAbortReport
+
+```typescript
+// Copyright (c) 2026 Ronan Le Meillat - SCTG Development
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
+import type { CandidateCommit } from "../git/git-client.js"
+
+/**
+ * Builds a partial sync report when the agent run was aborted due to the context
+ * window hard limit being reached before `generate_report` could be called.
+ *
+ * The checkpoint file preserves any SHAs that were successfully cherry-picked so
+ * the next run can resume from where this one stopped.
+ */
+export function buildContextAbortReport({
+  upstreamRef,
+  forkRef,
+  appliedShas,
+  syncBranch,
+  pendingCommits,
+  dryRun,
+}: {
+  upstreamRef: string
+  forkRef: string
+  appliedShas: string[]
+  syncBranch: string
+  pendingCommits: CandidateCommit[]
+  dryRun: boolean
+}): string {
+  const date = new Date().toISOString()
+  const dryRunNote = dryRun ? " [DRY RUN]" : ""
+
+  const appliedSet = new Set(appliedShas.map((s) => s.slice(0, 8)))
+  const blocked = pendingCommits.filter((c) => !appliedSet.has(c.sha.slice(0, 8)))
+
+  const lines: string[] = [
+    "## Backport Agent — Sync Report (context-limit abort)",
+    "",
+    `**Date**: ${date}`,
+    `**Upstream ref**: \`${upstreamRef}\``,
+    `**Fork ref**: \`${forkRef}\``,
+    `**Sync branch**: \`${syncBranch}\`${dryRunNote}`,
+    "",
+    "### Summary",
+    "",
+    `- ✅ Applied: ${appliedShas.length}`,
+    "- ⚠️ Needs human review: 0",
+    `- ⛔ Blocked (not attempted): ${blocked.length}`,
+    "",
+    "> ⚠️ **Run aborted — context window hard limit reached before `generate_report` was called.**",
+    "> The checkpoint file has been preserved. The next run will resume from the first unprocessed commit.",
+    "",
+  ]
+
+  if (appliedShas.length > 0) {
+    lines.push("### ✅ Applied commits (from checkpoint)")
+    lines.push("")
+    for (const sha of appliedShas) {
+      const match = pendingCommits.find((c) => c.sha.startsWith(sha.slice(0, 8)))
+      const subject = match?.subject ?? "(subject unknown)"
+      lines.push(`- \`${sha.slice(0, 8)}\` ${subject}`)
+    }
+    lines.push("")
+  }
+
+  if (blocked.length > 0) {
+    lines.push("### ⛔ Blocked commits (deferred to next run)")
+    lines.push("")
+    for (const c of blocked) {
+      lines.push(`- \`${c.sha.slice(0, 8)}\` — context-limit: deferred to next run`)
+      lines.push(`  - ${c.subject}`)
+    }
+    lines.push("")
+  }
+
+  return lines.join("\n")
+}
 ```
 
 ### `src/reports/noop-report.ts`

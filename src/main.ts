@@ -53,6 +53,7 @@ import { loadConfig } from "./config/loader.js"
 import { applyGitAuth, ensureWorkingDir } from "./git/git-init.js"
 import { ensureMergeBase, fetchRemotes, listCandidateCommits } from "./git/git-client.js"
 import { buildNoopSyncReport } from "./reports/noop-report.js"
+import { buildContextAbortReport } from "./reports/context-abort-report.js"
 import { setupAgent } from "./agent/agent-setup.js"
 import { setupEventHandlers } from "./agent/event-handlers.js"
 import { runWithRetry } from "./agent/retry-logic.js"
@@ -379,6 +380,38 @@ async function main() {
     } else {
       // With requireCompletionTool: true this should never happen on a clean run.
       throw new Error("Agent run completed but generate_report was never called (empty output). Check the prompt log for details.")
+    }
+  } catch (runErr) {
+    // Safety net: if the run was aborted due to the context window hard limit AND a
+    // checkpoint file exists, generate a partial report instead of crashing with exit 1.
+    // Correctif A (reset of lastInputTokens after compaction) should prevent this path in
+    // most cases, but this guard handles any remaining edge cases.
+    const msg = runErr instanceof Error ? runErr.message : String(runErr)
+    const isContextAbort = /context window limit|aborted/i.test(msg)
+    if (isContextAbort && existsSync(checkpointPath)) {
+      try {
+        const cp = JSON.parse(readFileSync(checkpointPath, "utf8")) as {
+          syncBranch?: string
+          appliedShas?: string[]
+          timestamp?: string
+        }
+        reportMarkdown = buildContextAbortReport({
+          upstreamRef,
+          forkRef,
+          appliedShas: cp.appliedShas ?? [],
+          syncBranch: cp.syncBranch ?? "(not created)",
+          pendingCommits,
+          dryRun: config.sync.dryRun,
+        })
+        console.error(`\n=== Run complete (context-limit abort) ===\n`)
+        console.error("[Context] Run aborted due to context limit — partial report generated; checkpoint preserved for next run.")
+        console.log(reportMarkdown)
+      } catch {
+        // If partial report generation fails, re-throw the original abort error.
+        throw runErr
+      }
+    } else {
+      throw runErr
     }
   } finally {
     userInstructionService.stop()
