@@ -61,29 +61,14 @@ import { CHECKPOINT_FILENAME } from "./git/git-tools.js"
 import type { SyncConfig } from "./config/schema.js"
 
 /**
- * Gets the sync branch name from the checkpoint file if available, otherwise generates
+ * Gets the sync branch name from the environment variable if available, otherwise generates
  * a fallback branch name using the same pattern as createSyncBranchTool.
  *
  * @param config - The sync configuration
  * @returns The sync branch name
  */
-function getSyncBranchNameFromCheckpoint(config: SyncConfig): string {
-  const checkpointPath = joinPath(config.workingDir, CHECKPOINT_FILENAME)
-  if (existsSync(checkpointPath)) {
-    try {
-      const checkpoint = JSON.parse(readFileSync(checkpointPath, "utf8"))
-      if (checkpoint.syncBranch) {
-        return checkpoint.syncBranch
-      }
-    } catch {
-      // Silently fall through to default
-    }
-  }
-  // Default fallback - matches the pattern used in createSyncBranchTool
-  const now = new Date()
-  const date = now.toISOString().slice(0, 10)
-  const time = now.toISOString().slice(11, 19).replace(/:/g, "")
-  return `${config.sync.branchPrefix}${config.upstream.branch}-${date}-${time}`
+function getSyncBranchNameFromEnvironmentVariable(config: SyncConfig): string {
+  return process.env.BACKPORT_AGENT_SYNC_BRANCH ?? `sync/${config.upstream.branch}-to-${config.fork.branch}`
 }
 
 // ---------------------------------------------------------------------------
@@ -370,7 +355,7 @@ async function main() {
       console.log(reportMarkdown)
       if (verbose) {
         // Shows a one line command for merging the new branch in the terminal, if the report contains a new branch to merge.
-        const syncBranchName = getSyncBranchNameFromCheckpoint(config)
+        const syncBranchName = getSyncBranchNameFromEnvironmentVariable(config)
         const commandLine = `# Sample merge command:
   pushd ${config.workingDir}
      git checkout ${config.fork.branch} && git merge ${syncBranchName} && git branch -D ${syncBranchName} && git push

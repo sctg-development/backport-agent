@@ -416,6 +416,7 @@ export function getCommitDiff(cwd: string, sha: string, maxBytes = 32_000): stri
  * @param forkRef    - Full ref of the fork branch to branch off, e.g. `"origin/main"`.
  */
 export function createSyncBranch(cwd: string, branchName: string, forkRef: string): void {
+  process.env.BACKPORT_AGENT_SYNC_BRANCH = branchName
   // First check out the fork branch tip to set HEAD correctly.
   git(["checkout", forkRef], cwd)
   // Then create and switch to the new sync branch.
