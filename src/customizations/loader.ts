@@ -37,7 +37,7 @@
 
 import { readFileSync } from "node:fs"
 import { resolve } from "node:path"
-import yaml from "js-yaml"
+import { load as jsYamlLoad } from "js-yaml"
 import { CustomizationsSchema, type Customizations } from "./schema.js"
 
 /**
@@ -68,10 +68,10 @@ export async function loadCustomizations(source?: string | Record<string, unknow
       throw new Error(`Failed to fetch customizations from ${strSource}: HTTP ${response.status} ${response.statusText}`)
     }
     const text = await response.text()
-    raw = yaml.load(text)
+    raw = jsYamlLoad(text)
   } else {
     // Local file path
-    raw = yaml.load(readFileSync(strSource as string, "utf-8"))
+    raw = jsYamlLoad(readFileSync(strSource as string, "utf-8"))
   }
 
   return CustomizationsSchema.parse(raw)

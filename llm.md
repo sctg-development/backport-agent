@@ -3,7 +3,7 @@ title: "Backport-agent an ai assistant for backporting"
 description: "An ai assistant for backporting code changes from upstream repositories"
 framework: backport-agent
 stack: "cline sdk"
-generated: "2026-06-20"
+generated: "2026-06-22"
 slim_mode: false
 files_total: 26
 ---
@@ -1136,9 +1136,33 @@ export async function compactConversation(
         .join("\n")
     : "(original task unavailable)"
 
-  // Keep the last 6 messages verbatim as a recency window so the model knows
+  // Keep the last few messages verbatim as a recency window so the model knows
   // exactly what step it was on when compaction fired.
-  const recentMessages = messages.slice(-6)
+  // Expand backwards until every tool-result in the window has its matching
+  // tool-call also in the window (orphaned results cause provider errors).
+  const RECENT_WINDOW = 6
+  let windowStart = Math.max(0, messages.length - RECENT_WINDOW)
+
+  type PartWithCallId = AgentMessagePart & { toolCallId: string }
+  while (windowStart > 0) {
+    const window = messages.slice(windowStart)
+    const presentCallIds = new Set(
+      window
+        .flatMap((m) => m.content)
+        .filter((p): p is PartWithCallId => p.type === "tool-call" && "toolCallId" in p)
+        .map((p) => p.toolCallId),
+    )
+    const hasOrphan = window.some((m) =>
+      m.content.some(
+        (p: AgentMessagePart): p is PartWithCallId =>
+          p.type === "tool-result" && "toolCallId" in p && !presentCallIds.has((p as PartWithCallId).toolCallId),
+      ),
+    )
+    if (!hasOrphan) break
+    windowStart--
+  }
+
+  const recentMessages = messages.slice(windowStart)
 
   // Serialize the full conversation for the summarizer.
   const transcript = serializeMessages(messages)
@@ -3979,7 +4003,7 @@ export type SyncConfig = z.infer<typeof SyncConfigSchema>
 
 import { readFileSync } from "node:fs"
 import { resolve } from "node:path"
-import yaml from "js-yaml"
+import { load as jsYamlLoad } from "js-yaml"
 import { CustomizationsSchema, type Customizations } from "./schema.js"
 
 /**
@@ -4010,10 +4034,10 @@ export async function loadCustomizations(source?: string | Record<string, unknow
       throw new Error(`Failed to fetch customizations from ${strSource}: HTTP ${response.status} ${response.statusText}`)
     }
     const text = await response.text()
-    raw = yaml.load(text)
+    raw = jsYamlLoad(text)
   } else {
     // Local file path
-    raw = yaml.load(readFileSync(strSource as string, "utf-8"))
+    raw = jsYamlLoad(readFileSync(strSource as string, "utf-8"))
   }
 
   return CustomizationsSchema.parse(raw)
@@ -4576,6 +4600,7 @@ export function getCommitDiff(cwd: string, sha: string, maxBytes = 32_000): stri
  * @param forkRef    - Full ref of the fork branch to branch off, e.g. `"origin/main"`.
  */
 export function createSyncBranch(cwd: string, branchName: string, forkRef: string): void {
+  process.env.BACKPORT_AGENT_SYNC_BRANCH = branchName
   // First check out the fork branch tip to set HEAD correctly.
   git(["checkout", forkRef], cwd)
   // Then create and switch to the new sync branch.
@@ -5907,29 +5932,14 @@ import { CHECKPOINT_FILENAME } from "./git/git-tools.js"
 import type { SyncConfig } from "./config/schema.js"
 
 /**
- * Gets the sync branch name from the checkpoint file if available, otherwise generates
+ * Gets the sync branch name from the environment variable if available, otherwise generates
  * a fallback branch name using the same pattern as createSyncBranchTool.
  *
  * @param config - The sync configuration
  * @returns The sync branch name
  */
-function getSyncBranchNameFromCheckpoint(config: SyncConfig): string {
-  const checkpointPath = joinPath(config.workingDir, CHECKPOINT_FILENAME)
-  if (existsSync(checkpointPath)) {
-    try {
-      const checkpoint = JSON.parse(readFileSync(checkpointPath, "utf8"))
-      if (checkpoint.syncBranch) {
-        return checkpoint.syncBranch
-      }
-    } catch {
-      // Silently fall through to default
-    }
-  }
-  // Default fallback - matches the pattern used in createSyncBranchTool
-  const now = new Date()
-  const date = now.toISOString().slice(0, 10)
-  const time = now.toISOString().slice(11, 19).replace(/:/g, "")
-  return `${config.sync.branchPrefix}${config.upstream.branch}-${date}-${time}`
+function getSyncBranchNameFromEnvironmentVariable(config: SyncConfig): string {
+  return process.env.BACKPORT_AGENT_SYNC_BRANCH ?? `sync/${config.upstream.branch}-to-${config.fork.branch}`
 }
 
 // ---------------------------------------------------------------------------
@@ -6216,7 +6226,7 @@ async function main() {
       console.log(reportMarkdown)
       if (verbose) {
         // Shows a one line command for merging the new branch in the terminal, if the report contains a new branch to merge.
-        const syncBranchName = getSyncBranchNameFromCheckpoint(config)
+        const syncBranchName = getSyncBranchNameFromEnvironmentVariable(config)
         const commandLine = `# Sample merge command:
   pushd ${config.workingDir}
      git checkout ${config.fork.branch} && git merge ${syncBranchName} && git branch -D ${syncBranchName} && git push
