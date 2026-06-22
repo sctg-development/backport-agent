@@ -181,9 +181,33 @@ export async function compactConversation(
         .join("\n")
     : "(original task unavailable)"
 
-  // Keep the last 6 messages verbatim as a recency window so the model knows
+  // Keep the last few messages verbatim as a recency window so the model knows
   // exactly what step it was on when compaction fired.
-  const recentMessages = messages.slice(-6)
+  // Expand backwards until every tool-result in the window has its matching
+  // tool-call also in the window (orphaned results cause provider errors).
+  const RECENT_WINDOW = 6
+  let windowStart = Math.max(0, messages.length - RECENT_WINDOW)
+
+  type PartWithCallId = AgentMessagePart & { toolCallId: string }
+  while (windowStart > 0) {
+    const window = messages.slice(windowStart)
+    const presentCallIds = new Set(
+      window
+        .flatMap((m) => m.content)
+        .filter((p): p is PartWithCallId => p.type === "tool-call" && "toolCallId" in p)
+        .map((p) => p.toolCallId),
+    )
+    const hasOrphan = window.some((m) =>
+      m.content.some(
+        (p: AgentMessagePart): p is PartWithCallId =>
+          p.type === "tool-result" && "toolCallId" in p && !presentCallIds.has((p as PartWithCallId).toolCallId),
+      ),
+    )
+    if (!hasOrphan) break
+    windowStart--
+  }
+
+  const recentMessages = messages.slice(windowStart)
 
   // Serialize the full conversation for the summarizer.
   const transcript = serializeMessages(messages)
