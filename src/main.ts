@@ -46,19 +46,19 @@
  *  vault-based key rotation via `KEYPOOL_VAULT_URL`.
  */
 /// <reference types="node" />
-import { existsSync, mkdirSync, readFileSync } from "node:fs"
-import { resolve as resolvePath, join as joinPath } from "node:path"
-import { parseCliArgs } from "./cli/args.js"
-import { loadConfig } from "./config/loader.js"
-import { applyGitAuth, ensureWorkingDir } from "./git/git-init.js"
-import { ensureMergeBase, fetchRemotes, listCandidateCommits } from "./git/git-client.js"
-import { buildNoopSyncReport } from "./reports/noop-report.js"
-import { buildContextAbortReport } from "./reports/context-abort-report.js"
-import { setupAgent } from "./agent/agent-setup.js"
-import { setupEventHandlers } from "./agent/event-handlers.js"
-import { runWithRetry } from "./agent/retry-logic.js"
-import { CHECKPOINT_FILENAME } from "./git/git-tools.js"
-import type { SyncConfig } from "./config/schema.js"
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { resolve as resolvePath, join as joinPath } from "node:path";
+import { parseCliArgs } from "./cli/args.js";
+import { loadConfig } from "./config/loader.js";
+import { applyGitAuth, ensureWorkingDir } from "./git/git-init.js";
+import { ensureMergeBase, fetchRemotes, listCandidateCommits } from "./git/git-client.js";
+import { buildNoopSyncReport } from "./reports/noop-report.js";
+import { buildContextAbortReport } from "./reports/context-abort-report.js";
+import { setupAgent } from "./agent/agent-setup.js";
+import { setupEventHandlers } from "./agent/event-handlers.js";
+import { runWithRetry } from "./agent/retry-logic.js";
+import { CHECKPOINT_FILENAME } from "./git/git-tools.js";
+import type { SyncConfig } from "./config/schema.js";
 
 /**
  * Gets the sync branch name from the environment variable if available, otherwise generates
@@ -238,6 +238,7 @@ async function main() {
     config.workingDir,
     upstreamRef,
     forkRef,
+    config.upstream.cutDate ? new Date(config.upstream.cutDate) : undefined,
     config.sync.prNumberMatching.enabled ? config.sync.prNumberMatching : undefined,
   )
 
@@ -249,7 +250,7 @@ async function main() {
     } else {
       console.log(`${pending.length} commit(s) pending backport from ${upstreamRef} into ${forkRef} (oldest first):\n`)
       for (const c of pending) {
-        console.log(`${c.sha}  ${c.subject}`)
+        console.log(`${c.date.toISOString()}   ${c.sha}  ${c.subject}`)
       }
     }
     return

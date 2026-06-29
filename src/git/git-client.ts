@@ -34,8 +34,8 @@
  *    level orchestration lives in `git-tools.ts` (agent tool wrappers).
  */
 
-import { execFileSync } from "node:child_process"
-import { readFileSync, writeFileSync } from "node:fs"
+import { execFileSync } from "node:child_process";
+import { readFileSync, writeFileSync } from "node:fs";
 
 /**
  * Executes a git command in the given working directory using `execFileSync`.
@@ -69,6 +69,10 @@ export type CandidateCommit = {
    * Such commits are reported but skipped without cherry-picking.
    */
   alreadyApplied: boolean
+  /**
+   * date of the commit (Date)
+   */
+  date: Date
 }
 
 /**
@@ -230,6 +234,7 @@ export function listCandidateCommits(
   cwd: string,
   upstreamRef: string,
   forkRef: string,
+  cutDate: Date | undefined,
   prNumberMatching?: PrNumberMatchingOptions,
 ): CandidateCommit[] {
   // `git cherry -v <fork> <upstream>` lists commits reachable from <upstream>
@@ -239,24 +244,26 @@ export function listCandidateCommits(
   // Empty output means upstream and fork are already in sync.
   if (!cherryOutput) return []
 
-  const rawCandidates = cherryOutput.split("\n").map((line) => {
+  let rawCandidates = cherryOutput.split("\n").map((line) => {
     // Each line: `<marker> <sha> <subject>` where marker is `+` or `-`.
     const marker = line[0]
     const rest = line.slice(2) // skip marker and space
     const spaceIdx = rest.indexOf(" ")
     const sha = rest.slice(0, spaceIdx)
     const subject = rest.slice(spaceIdx + 1)
+    const dateOutput = git(["show", "-s", "--format=%cI", sha], cwd)
+    const date = new Date(dateOutput.trim())
     return {
       sha,
       subject,
+      date,
       // `-` means an equivalent patch already exists in the fork.
       alreadyApplied: marker === "-",
     }
   })
 
-  // Fast path: if git cherry already marked every commit as applied, skip the
-  // secondary pass entirely.
-  if (rawCandidates.every((c) => c.alreadyApplied)) return rawCandidates
+  // Filter out commits that are older than the cutDate, if provided
+  rawCandidates = cutDate ? rawCandidates.filter((c) => c.date >= cutDate) : rawCandidates
 
   // Secondary detection pass — catches cherry-picks that were modified during
   // conflict resolution (different patch content breaks git cherry's comparison).
@@ -275,75 +282,75 @@ export function listCandidateCommits(
     // Fork branch may not exist locally yet; ignore and fall back to git cherry only.
   }
 
-// Signal 2: upstream SHA referenced inside a fork commit message body.
-    // `git cherry-pick -x` appends "(cherry picked from commit <sha>)" automatically.
-    const forkShaRefs = new Set<string>()
+  // Signal 2: upstream SHA referenced inside a fork commit message body.
+  // `git cherry-pick -x` appends "(cherry picked from commit <sha>)" automatically.
+  const forkShaRefs = new Set<string>()
+  try {
+    const bodyLog = git(["log", forkRef, "--format=%B", `--max-count=${FORK_LOG_DEPTH}`], cwd)
+    for (const m of bodyLog.matchAll(/cherry.picked from commit ([0-9a-f]{7,40})/gi)) {
+      forkShaRefs.add(m[1].toLowerCase())
+    }
+  } catch {
+    // Ignore — missing body log is non-fatal; subject matching still works.
+  }
+
+  // Signal 4 (optional): PR-number match with subject-similarity guard.
+  // Build an index of PR numbers → fork subjects that reference them.
+  // Only populated when prNumberMatching?.enabled is true.
+  const forkPrIndex = new Map<number, string[]>()
+  if (prNumberMatching?.enabled) {
     try {
-      const bodyLog = git(["log", forkRef, "--format=%B", `--max-count=${FORK_LOG_DEPTH}`], cwd)
-      for (const m of bodyLog.matchAll(/cherry.picked from commit ([0-9a-f]{7,40})/gi)) {
-        forkShaRefs.add(m[1].toLowerCase())
+      const subjectLog = git(["log", forkRef, "--format=%s", `--max-count=${FORK_LOG_DEPTH}`], cwd)
+      for (const subj of subjectLog.split("\n")) {
+        const trimmed = subj.trim()
+        if (!trimmed) continue
+        for (const m of trimmed.matchAll(/#(\d+)/g)) {
+          const num = parseInt(m[1], 10)
+          const bucket = forkPrIndex.get(num)
+          if (bucket) bucket.push(trimmed)
+          else forkPrIndex.set(num, [trimmed])
+        }
       }
     } catch {
-      // Ignore — missing body log is non-fatal; subject matching still works.
+      // Non-fatal — fall back to the other three signals.
     }
+  }
 
-    // Signal 4 (optional): PR-number match with subject-similarity guard.
-    // Build an index of PR numbers → fork subjects that reference them.
-    // Only populated when prNumberMatching?.enabled is true.
-    const forkPrIndex = new Map<number, string[]>()
-    if (prNumberMatching?.enabled) {
-      try {
-        const subjectLog = git(["log", forkRef, "--format=%s", `--max-count=${FORK_LOG_DEPTH}`], cwd)
-        for (const subj of subjectLog.split("\n")) {
-          const trimmed = subj.trim()
-          if (!trimmed) continue
-          for (const m of trimmed.matchAll(/#(\d+)/g)) {
-            const num = parseInt(m[1], 10)
-            const bucket = forkPrIndex.get(num)
-            if (bucket) bucket.push(trimmed)
-            else forkPrIndex.set(num, [trimmed])
-          }
-        }
-      } catch {
-        // Non-fatal — fall back to the other three signals.
+  return rawCandidates.map((c) => {
+    if (c.alreadyApplied) return c
+
+    // Signal 1: exact subject match.
+    if (forkSubjects.has(c.subject)) return { ...c, alreadyApplied: true }
+
+    // Signal 2: upstream SHA referenced inside a fork commit message.
+    // A fork commit references this upstream SHA when one is a prefix of the
+    // other (handles both abbreviated 7-char refs and full 40-char SHAs).
+    const upSha = c.sha.toLowerCase()
+    for (const ref of forkShaRefs) {
+      if (upSha.startsWith(ref) || ref.startsWith(upSha)) {
+        return { ...c, alreadyApplied: true }
       }
     }
 
-    return rawCandidates.map((c) => {
-      if (c.alreadyApplied) return c
-
-      // Signal 1: exact subject match.
-      if (forkSubjects.has(c.subject)) return { ...c, alreadyApplied: true }
-
-      // Signal 2: upstream SHA referenced inside a fork commit message.
-      // A fork commit references this upstream SHA when one is a prefix of the
-      // other (handles both abbreviated 7-char refs and full 40-char SHAs).
-      const upSha = c.sha.toLowerCase()
-      for (const ref of forkShaRefs) {
-        if (upSha.startsWith(ref) || ref.startsWith(upSha)) {
+    // Signal 4: PR number present in both subjects, similarity above threshold.
+    if (prNumberMatching?.enabled) {
+      const upPrMatch = c.subject.match(/#(\d+)/)
+      if (upPrMatch) {
+        const prNum = parseInt(upPrMatch[1], 10)
+        const forkMatches = forkPrIndex.get(prNum)
+        if (
+          forkMatches?.some(
+            (s) => subjectSimilarity(c.subject, s) >= prNumberMatching.minSubjectSimilarity,
+          )
+        ) {
           return { ...c, alreadyApplied: true }
         }
       }
+    }
 
-      // Signal 4: PR number present in both subjects, similarity above threshold.
-      if (prNumberMatching?.enabled) {
-        const upPrMatch = c.subject.match(/#(\d+)/)
-        if (upPrMatch) {
-          const prNum = parseInt(upPrMatch[1], 10)
-          const forkMatches = forkPrIndex.get(prNum)
-          if (
-            forkMatches?.some(
-              (s) => subjectSimilarity(c.subject, s) >= prNumberMatching.minSubjectSimilarity,
-            )
-          ) {
-            return { ...c, alreadyApplied: true }
-          }
-        }
-      }
-
-      return c
-    })
-  }
+    return c
+  })
+}
 
 /**
  * Returns the list of file paths changed by a single commit, with status prefixes

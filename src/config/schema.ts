@@ -35,7 +35,7 @@
  *  - `validation` – shell commands executed after cherry-picking, grouped by risk level
  */
 
-import { z } from "zod"
+import { z } from "zod";
 
 /**
  * Full Zod validation schema for the backport-agent configuration.
@@ -69,6 +69,8 @@ export const SyncConfigSchema = z.object({
     branch: z.string().describe("Upstream branch to sync from"),
     /** Local git remote name pointing to the upstream repo. Defaults to `"upstream"`. */
     remote: z.string().default("upstream").describe("Git remote name for upstream"),
+    /** Option cutDate in iso format */
+    cutDate: z.string().optional().describe("Cut date for upstream commits")
   }),
 
   /**

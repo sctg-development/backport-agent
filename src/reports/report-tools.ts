@@ -50,14 +50,14 @@
  *  8. AI sub-agent call log — full prompt/response transcript from the JSONL log.
  */
 
-import { z } from "zod"
-import { readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync } from "node:fs"
-import { resolve as resolvePath, join as joinPath, relative as relativePath } from "node:path"
-import { git } from "../git/git-client.js"
-import { CHECKPOINT_FILENAME } from "../git/git-tools.js"
-import { Agent } from "@sctg/cline-sdk"
-import { defineTool } from "../tool-helper.js"
-import type { SyncConfig } from "../config/schema.js"
+import { z } from "zod";
+import { readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync } from "node:fs";
+import { resolve as resolvePath, join as joinPath, relative as relativePath } from "node:path";
+import { git } from "../git/git-client.js";
+import { CHECKPOINT_FILENAME } from "../git/git-tools.js";
+import { Agent } from "@sctg/cline-sdk";
+import { defineTool } from "../tool-helper.js";
+import type { SyncConfig } from "../config/schema.js";
 
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -355,6 +355,7 @@ export function makeReportTool(
         "",
         `**Date**: ${date}`,
         `**Upstream ref**: \`${upstreamRef}\``,
+        `**Cut date**: ${config.upstream.cutDate ? `\`${config.upstream.cutDate}\`` : "_none (all commits considered)_"} `,
         `**Fork ref**: \`${forkRef}\``,
         `**Sync branch**: ${syncBranch ? `\`${syncBranch}\`` : "_dry-run (no branch created)_"}`,
         "",
