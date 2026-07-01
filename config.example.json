@@ -40,7 +40,9 @@
     "apiKey": "auto",
     "fast": "mistral/devstral-latest",
     "specialist": "mistral/devstral-latest",
-    "powerful": "mistral/magistral-medium-latest"
+    "powerful": "mistral/magistral-medium-latest",
+    "summarizer": "gemini/gemini-3-flash-preview",
+    "_comment_summarizer": "Optional: Large context model"
   },
   "ai": {
     "_comment": "AI quality guardrails — all fields are optional (defaults shown). Remove this section to use defaults.",
