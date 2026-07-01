@@ -78,6 +78,7 @@ export function makeValidationTool(config: SyncConfig) {
     execute: async ({ riskLevel, extraCommands = [] }) => {
       // Dry-run: skip all command execution and report success.
       if (config.sync.dryRun) {
+        process.stderr.write(`[Validation] Skipped (dry-run mode): ${riskLevel} suite\n`)
         return { dryRun: true, results: [], allPassed: true }
       }
 
@@ -90,20 +91,31 @@ export function makeValidationTool(config: SyncConfig) {
         final: config.validation.final ?? [],
       }
 
-      // Config-defined commands run via bash (supports pushd/popd, &&, etc.).
       const configCommands = suites[riskLevel]
+      const totalExtra = extraCommands.length
+
+      process.stderr.write(
+        `\n[Validation] ═══ Starting "${riskLevel}" suite` +
+        ` (${configCommands.length} command(s)${totalExtra > 0 ? ` + ${totalExtra} extra` : ""}) ═══\n`,
+      )
+
+      // Config-defined commands run via bash (supports pushd/popd, &&, etc.).
       const configResults = runTrustedSuite(configCommands, config.workingDir)
       const configPassed = configResults.every((r) => r.success)
 
       // LLM-suggested extraCommands run only when the config suite passed,
       // and they remain subject to the prefix allowlist.
       const extraResults =
-        configPassed && extraCommands.length > 0
+        configPassed && totalExtra > 0
           ? runValidationSuite(extraCommands, config.workingDir)
           : []
 
       const allResults = [...configResults, ...extraResults]
       const allPassed = allResults.every((r) => r.success)
+
+      process.stderr.write(
+        `[Validation] ═══ "${riskLevel}" suite ${allPassed ? "PASSED ✓" : "FAILED ✗"} ═══\n\n`,
+      )
 
       return { riskLevel, results: allResults, allPassed }
     },

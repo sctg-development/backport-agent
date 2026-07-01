@@ -196,19 +196,51 @@ export function runValidationCommand(command: string, cwd: string): CommandResul
  * "Fail fast" semantics are intentional: the agent should see the first broken
  * command and address it rather than drowning in cascading failures.
  *
+ * Progress is streamed to stderr: each command is announced before it starts
+ * and its result (with elapsed time) shown immediately after.
+ *
  * @param commands - Ordered array of command strings to execute.
  * @param cwd      - Absolute working directory for all commands.
  * @returns Array of `CommandResult` objects, one per executed command.
  *          If a command fails, no subsequent commands are executed.
  */
 export function runValidationSuite(commands: string[], cwd: string): CommandResult[] {
+  const total = commands.length
+  if (total === 0) return []
+
+  process.stderr.write(`[Validation] Extra suite: ${total} command(s)\n`)
+
   const results: CommandResult[] = []
-  for (const command of commands) {
+  for (const [i, command] of commands.entries()) {
+    const n = i + 1
+    const shortCmd = command.length > 100 ? command.slice(0, 100) + "…" : command
+    process.stderr.write(`[Validation] [${n}/${total}] ${shortCmd}\n`)
+
+    const t0 = Date.now()
     const result = runValidationCommand(command, cwd)
+    const elapsed = formatElapsed(Date.now() - t0)
+
     results.push(result)
-    // Stop on first failure — no point running further checks.
-    if (!result.success) break
+
+    if (result.success) {
+      process.stderr.write(`[Validation] ✓  passed (${elapsed})\n`)
+    } else {
+      process.stderr.write(`[Validation] ✗  FAILED exit=${result.exitCode} (${elapsed})\n`)
+      printTailOutput(result.output)
+      process.stderr.write(`[Validation] Stopped after failure at step ${n}/${total}\n`)
+      break
+    }
   }
+
+  const passed = results.filter((r) => r.success).length
+  const failed = results.filter((r) => !r.success).length
+  if (failed === 0) {
+    process.stderr.write(`[Validation] All ${passed}/${total} extra command(s) passed\n`)
+  } else {
+    process.stderr.write(`[Validation] ${passed}/${total} passed, ${failed} FAILED\n`)
+  }
+
+  // Stop on first failure — no point running further checks.
   return results
 }
 
@@ -249,21 +281,78 @@ export function runShellCommand(command: string, cwd: string): CommandResult {
 }
 
 /**
+ * Formats an elapsed duration in milliseconds into a human-readable string.
+ * Shows milliseconds for fast commands and seconds (1 d.p.) for slow ones.
+ */
+function formatElapsed(ms: number): string {
+  return ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${ms}ms`
+}
+
+/**
+ * Emits the last `maxLines` non-empty lines of `output` to stderr, framed by
+ * a header/footer so the user can identify it as validation output at a glance.
+ */
+function printTailOutput(output: string, maxLines = 15): void {
+  const lines = output.split("\n").filter(Boolean)
+  if (lines.length === 0) return
+  const tail = lines.slice(-maxLines)
+  process.stderr.write(`[Validation] ┌─ output (last ${tail.length} line(s)) ─\n`)
+  for (const line of tail) {
+    process.stderr.write(`[Validation] │ ${line}\n`)
+  }
+  process.stderr.write(`[Validation] └─────────────────────────────────\n`)
+}
+
+/**
  * Runs an ordered list of trusted (config-defined) shell commands via `bash -c`.
  *
  * Uses the same fail-fast semantics as `runValidationSuite` but calls `runShellCommand`
  * instead of the allowlisted runner, so compound commands are fully supported.
+ *
+ * Progress is streamed to stderr so the user can follow long-running suites in
+ * real time: each command is announced before it starts, and its result (with
+ * elapsed time) is shown immediately after it finishes.  On failure, the last
+ * lines of output are shown for immediate diagnosis.
  *
  * @param commands - Ordered array of shell command strings.
  * @param cwd      - Absolute working directory for all commands.
  * @returns Array of `CommandResult` objects, stopping on the first failure.
  */
 export function runTrustedSuite(commands: string[], cwd: string): CommandResult[] {
+  const total = commands.length
+  if (total === 0) return []
+
+  process.stderr.write(`[Validation] Suite: ${total} command(s) in ${cwd}\n`)
+
   const results: CommandResult[] = []
-  for (const command of commands) {
+  for (const [i, command] of commands.entries()) {
+    const n = i + 1
+    const shortCmd = command.length > 100 ? command.slice(0, 100) + "…" : command
+    process.stderr.write(`[Validation] [${n}/${total}] ${shortCmd}\n`)
+
+    const t0 = Date.now()
     const result = runShellCommand(command, cwd)
+    const elapsed = formatElapsed(Date.now() - t0)
+
     results.push(result)
-    if (!result.success) break
+
+    if (result.success) {
+      process.stderr.write(`[Validation] ✓  passed (${elapsed})\n`)
+    } else {
+      process.stderr.write(`[Validation] ✗  FAILED exit=${result.exitCode} (${elapsed})\n`)
+      printTailOutput(result.output)
+      process.stderr.write(`[Validation] Stopped after failure at step ${n}/${total}\n`)
+      break
+    }
   }
+
+  const passed = results.filter((r) => r.success).length
+  const failed = results.filter((r) => !r.success).length
+  if (failed === 0) {
+    process.stderr.write(`[Validation] All ${passed}/${total} command(s) passed\n`)
+  } else {
+    process.stderr.write(`[Validation] ${passed}/${total} passed, ${failed} FAILED\n`)
+  }
+
   return results
 }
