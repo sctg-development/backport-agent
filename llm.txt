@@ -1,4 +1,4 @@
-Backport-agent e-commerce framework — source index (2026-06-22)
+Backport-agent e-commerce framework — source index (2026-07-01)
 Stack: Cline SDK with name @sctg/cline-sdk
 
 FILES

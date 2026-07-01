@@ -3,7 +3,7 @@ title: "Backport-agent an ai assistant for backporting"
 description: "An ai assistant for backporting code changes from upstream repositories"
 framework: backport-agent
 stack: "cline sdk"
-generated: "2026-06-22"
+generated: "2026-07-01"
 slim_mode: false
 files_total: 26
 ---
@@ -1081,27 +1081,20 @@ export function serializeMessages(messages: readonly AgentMessage[]): string {
 // ---------------------------------------------------------------------------
 
 /**
- * Resolve the provider/model/key to use for compaction.
- * Falls back to `models.specialist` with the same provider if `models.summarizer` is absent.
+ * Resolve the provider/model/key to use for compaction and last-resort conflict resolution.
+ * Uses the same provider and API key as the main agent so it works out of the box with
+ * keypoollive (which routes `gemini/gemini-3-flash-preview` automatically).
  */
 export function getSummarizerConfig(config: SyncConfig): SummarizerConfig {
-  if (config.models.summarizer) {
-    const { provider, modelId, apiKey } = config.models.summarizer
-    // If apiKey is an env-var reference (starts with "$"), resolve it.
-    const resolvedKey = apiKey?.startsWith("$") ? process.env[apiKey.slice(1)] : apiKey
-    return { providerId: provider, modelId, apiKey: resolvedKey }
-  }
-  // Fallback: use specialist model with the same provider and API key as the main agent.
-  // Note: the main API key is accessed via config; provider.ts resolution happens upstream.
-  const fallbackKey = config.models.apiKey === "auto"
+  const apiKey = config.models.apiKey === "auto"
     ? undefined
     : config.models.apiKey?.startsWith("$")
       ? process.env[config.models.apiKey.slice(1)]
       : config.models.apiKey
   return {
     providerId: config.models.provider,
-    modelId: config.models.specialist,
-    apiKey: fallbackKey,
+    modelId: config.models.summarizer,
+    apiKey,
   }
 }
 
@@ -1312,7 +1305,9 @@ export function setupEventHandlers(params: EventHandlersParams): EventHandlersRe
   // --- Shared iteration state ---
   // Track iterations across retry attempts: when restarting after an error,
   // display should show the max iteration seen before the retry (not cumulative).
-  let lastEventWasText = false
+  // lastOutput tracks the last stream that wrote a partial line (no trailing \n)
+  // so we can insert a newline before switching streams.
+  let lastOutput: "text" | "reasoning" | "none" = "none"
   let maxIterationFromPreviousRuns = 0
   let lastSeenIteration = 0
   let currentAttempt = 1
@@ -1326,28 +1321,69 @@ export function setupEventHandlers(params: EventHandlersParams): EventHandlersRe
         lastSeenIteration = rawIter
       }
       const displayIter = typeof rawIter === "number" ? maxIterationFromPreviousRuns + rawIter : "?"
+
       if (event.type === "assistant-text-delta") {
-        lastEventWasText = true
+        // Ensure we start on a fresh line when switching from reasoning output
+        if (lastOutput === "reasoning") process.stderr.write("\n")
+        lastOutput = "text"
         process.stdout.write(event.text)
-      } else if (event.type === "tool-started" && verbose) {
-        if (lastEventWasText) process.stderr.write("\n")
-        lastEventWasText = false
+
+      } else if (event.type === "assistant-reasoning-delta" && verbose) {
+        // Show model thinking in verbose mode; prefix the first delta of each block
+        if (lastOutput === "text") process.stderr.write("\n")
+        if (lastOutput !== "reasoning") process.stderr.write("[thinking] ")
+        lastOutput = "reasoning"
+        // Strip redacted reasoning (null/empty)
+        const text = (event as unknown as { text?: string; redacted?: boolean }).text
+        const redacted = (event as unknown as { redacted?: boolean }).redacted
+        if (!redacted && text) process.stderr.write(text)
+
+      } else if (event.type === "tool-started") {
+        // Always emit a newline when leaving a streaming block, then show the tool.
+        if (lastOutput === "text" || lastOutput === "reasoning") process.stderr.write("\n")
+        lastOutput = "none"
         const inp = event.toolCall.input as Record<string, unknown>
-        const preview =
-          inp && typeof inp === "object" && Object.keys(inp).length > 0
-            ? Object.keys(inp)
-                .slice(0, 2)
-                .map((k) => `${k}=${JSON.stringify(inp[k]).slice(0, 60)}`)
-                .join(", ")
-            : "(no input)"
-        process.stderr.write(`[→ iter ${displayIter}] ${event.toolCall.toolName}(${preview})\n`)
+        // Keys that hold large file content — skip in previews to keep output readable.
+        const CONTENT_KEYS = new Set(["baseContent", "resolvedContent", "forkVersion", "upstreamVersion", "withMarkers", "content", "fileContent"])
+        if (verbose) {
+          // Detailed format: show meaningful input keys, skip large content blobs.
+          const meaningfulKeys = inp && typeof inp === "object"
+            ? Object.keys(inp).filter((k) => !CONTENT_KEYS.has(k))
+            : []
+          const preview =
+            meaningfulKeys.length > 0
+              ? meaningfulKeys
+                  .slice(0, 3)
+                  .map((k) => `${k}=${JSON.stringify(inp[k]).slice(0, 80)}`)
+                  .join(", ")
+              : Object.keys(inp ?? {}).length > 0
+                ? "(content omitted)"
+                : "(no input)"
+          process.stderr.write(`[→ iter ${displayIter}] ${event.toolCall.toolName}(${preview})\n`)
+        } else {
+          // Compact format: tool name + first meaningful key as hint so progress is visible
+          const meaningfulKeys = inp && typeof inp === "object"
+            ? Object.keys(inp).filter((k) => !CONTENT_KEYS.has(k))
+            : []
+          const firstKey = meaningfulKeys[0] ?? (inp && typeof inp === "object" ? Object.keys(inp)[0] : undefined)
+          const hint = firstKey !== undefined ? ` ${JSON.stringify(inp[firstKey]).slice(0, 60)}` : ""
+          process.stderr.write(`[→] ${event.toolCall.toolName}${hint}\n`)
+        }
+
       } else if (event.type === "tool-finished" && verbose) {
-        lastEventWasText = false
+        lastOutput = "none"
         const result = event.toolCall as unknown as { toolName: string }
         process.stderr.write(`[← iter ${displayIter}] ${result.toolName ?? event.toolCall.toolName} done\n`)
-      } else if ((event.type === "iteration_start" || event.type === "turn-started") && verbose) {
+
+      } else if (event.type === "iteration_start" || event.type === "turn-started") {
         const retrySuffix = currentAttempt > 1 ? ` - Retry ${currentAttempt - 1}` : ""
-        process.stderr.write(`\n--- iteration ${displayIter}${retrySuffix} ---\n`)
+        if (verbose) {
+          process.stderr.write(`\n--- iteration ${displayIter}${retrySuffix} ---\n`)
+        } else {
+          // Even without verbose, show turn boundaries so progress is visible
+          process.stderr.write(`\n[turn ${displayIter}${retrySuffix}]\n`)
+        }
+        lastOutput = "none"
       }
     })
   }
@@ -1671,6 +1707,9 @@ Produce a draft pull request with a clear report. Never push directly to the mai
             → add to blockedCommits with a precise reason from the AI analysis.
           - If uncertain: still attempt the cherry-pick; conflicts will surface in step 5c.
    d. Commits with alreadyApplied: true → record as "skipped" in commitResults.
+   e. bun.lock / bun.lockb conflicts → auto-resolved by the cherry_pick_commit tool: the lock file is
+      deleted and regenerated via "bun install" automatically. You will NOT see these in conflictedFiles.
+      For other lock files (package-lock.json, yarn.lock, pnpm-lock.yaml), prefer regenerating manually.
 4. Create the sync branch via create_sync_branch (once, before first cherry-pick).
 5. For each non-skipped commit (process lowest risk first):
    a. Call cherry_pick_commit.
@@ -3383,7 +3422,7 @@ export function resolveApiKey(config: SyncConfig): string | undefined {
  *  - `validation` – shell commands executed after cherry-picking, grouped by risk level
  */
 
-import { z } from "zod"
+import { z } from "zod";
 
 /**
  * Full Zod validation schema for the backport-agent configuration.
@@ -3417,6 +3456,8 @@ export const SyncConfigSchema = z.object({
     branch: z.string().describe("Upstream branch to sync from"),
     /** Local git remote name pointing to the upstream repo. Defaults to `"upstream"`. */
     remote: z.string().default("upstream").describe("Git remote name for upstream"),
+    /** Option cutDate in iso format */
+    cutDate: z.string().optional().describe("Cut date for upstream commits")
   }),
 
   /**
@@ -3707,23 +3748,16 @@ export const SyncConfigSchema = z.object({
         .default("mistral/magistral-medium-latest")
         .describe("High-capability model for conflict resolution (fallback)"),
       /**
-       * Optional model used exclusively for context compaction (the `prepareTurn` hook).
-       * Must have a large enough context window to ingest the full conversation transcript
-       * (~200k tokens) — Gemini 2.5 Flash (1M context) is the recommended choice.
-       * If absent, falls back to `models.specialist` with the same provider.
-       *
-       * With keypoollive vault:
-       *   { "provider": "keypoollive", "modelId": "gemini/gemini-2.5-flash-preview" }
-       * With direct Gemini API key:
-       *   { "provider": "gemini", "modelId": "gemini-2.5-flash-preview", "apiKey": "$GEMINI_API_KEY" }
+       * Last-resort model for context compaction (`prepareTurn` hook) and for resolving
+       * conflicts that are unsolvable without a very large context window.
+       * Must support at least 1M tokens — Gemini 3 Flash is the recommended choice.
+       * Uses the same provider and API key as the main agent (works out of the box
+       * with keypoollive, which routes `gemini/gemini-3-flash-preview` automatically).
        */
       summarizer: z
-        .object({
-          provider: z.string(),
-          modelId: z.string(),
-          apiKey: z.string().optional(),
-        })
-        .optional(),
+        .string()
+        .default("gemini/gemini-3-flash-preview")
+        .describe("Big context model (1M+ tokens) used as last resort for compaction and hard conflicts"),
     })
     // Allow omitting the entire models block; individual fields carry defaults.
     .default(() => ({} as any)),
@@ -4218,8 +4252,8 @@ export type Customizations = z.infer<typeof CustomizationsSchema>
  *    level orchestration lives in `git-tools.ts` (agent tool wrappers).
  */
 
-import { execFileSync } from "node:child_process"
-import { readFileSync, writeFileSync } from "node:fs"
+import { execFileSync } from "node:child_process";
+import { readFileSync, writeFileSync } from "node:fs";
 
 /**
  * Executes a git command in the given working directory using `execFileSync`.
@@ -4253,6 +4287,10 @@ export type CandidateCommit = {
    * Such commits are reported but skipped without cherry-picking.
    */
   alreadyApplied: boolean
+  /**
+   * date of the commit (Date)
+   */
+  date: Date
 }
 
 /**
@@ -4414,6 +4452,7 @@ export function listCandidateCommits(
   cwd: string,
   upstreamRef: string,
   forkRef: string,
+  cutDate: Date | undefined,
   prNumberMatching?: PrNumberMatchingOptions,
 ): CandidateCommit[] {
   // `git cherry -v <fork> <upstream>` lists commits reachable from <upstream>
@@ -4423,24 +4462,26 @@ export function listCandidateCommits(
   // Empty output means upstream and fork are already in sync.
   if (!cherryOutput) return []
 
-  const rawCandidates = cherryOutput.split("\n").map((line) => {
+  let rawCandidates = cherryOutput.split("\n").map((line) => {
     // Each line: `<marker> <sha> <subject>` where marker is `+` or `-`.
     const marker = line[0]
     const rest = line.slice(2) // skip marker and space
     const spaceIdx = rest.indexOf(" ")
     const sha = rest.slice(0, spaceIdx)
     const subject = rest.slice(spaceIdx + 1)
+    const dateOutput = git(["show", "-s", "--format=%cI", sha], cwd)
+    const date = new Date(dateOutput.trim())
     return {
       sha,
       subject,
+      date,
       // `-` means an equivalent patch already exists in the fork.
       alreadyApplied: marker === "-",
     }
   })
 
-  // Fast path: if git cherry already marked every commit as applied, skip the
-  // secondary pass entirely.
-  if (rawCandidates.every((c) => c.alreadyApplied)) return rawCandidates
+  // Filter out commits that are older than the cutDate, if provided
+  rawCandidates = cutDate ? rawCandidates.filter((c) => c.date >= cutDate) : rawCandidates
 
   // Secondary detection pass — catches cherry-picks that were modified during
   // conflict resolution (different patch content breaks git cherry's comparison).
@@ -4459,75 +4500,75 @@ export function listCandidateCommits(
     // Fork branch may not exist locally yet; ignore and fall back to git cherry only.
   }
 
-// Signal 2: upstream SHA referenced inside a fork commit message body.
-    // `git cherry-pick -x` appends "(cherry picked from commit <sha>)" automatically.
-    const forkShaRefs = new Set<string>()
+  // Signal 2: upstream SHA referenced inside a fork commit message body.
+  // `git cherry-pick -x` appends "(cherry picked from commit <sha>)" automatically.
+  const forkShaRefs = new Set<string>()
+  try {
+    const bodyLog = git(["log", forkRef, "--format=%B", `--max-count=${FORK_LOG_DEPTH}`], cwd)
+    for (const m of bodyLog.matchAll(/cherry.picked from commit ([0-9a-f]{7,40})/gi)) {
+      forkShaRefs.add(m[1].toLowerCase())
+    }
+  } catch {
+    // Ignore — missing body log is non-fatal; subject matching still works.
+  }
+
+  // Signal 4 (optional): PR-number match with subject-similarity guard.
+  // Build an index of PR numbers → fork subjects that reference them.
+  // Only populated when prNumberMatching?.enabled is true.
+  const forkPrIndex = new Map<number, string[]>()
+  if (prNumberMatching?.enabled) {
     try {
-      const bodyLog = git(["log", forkRef, "--format=%B", `--max-count=${FORK_LOG_DEPTH}`], cwd)
-      for (const m of bodyLog.matchAll(/cherry.picked from commit ([0-9a-f]{7,40})/gi)) {
-        forkShaRefs.add(m[1].toLowerCase())
+      const subjectLog = git(["log", forkRef, "--format=%s", `--max-count=${FORK_LOG_DEPTH}`], cwd)
+      for (const subj of subjectLog.split("\n")) {
+        const trimmed = subj.trim()
+        if (!trimmed) continue
+        for (const m of trimmed.matchAll(/#(\d+)/g)) {
+          const num = parseInt(m[1], 10)
+          const bucket = forkPrIndex.get(num)
+          if (bucket) bucket.push(trimmed)
+          else forkPrIndex.set(num, [trimmed])
+        }
       }
     } catch {
-      // Ignore — missing body log is non-fatal; subject matching still works.
+      // Non-fatal — fall back to the other three signals.
     }
+  }
 
-    // Signal 4 (optional): PR-number match with subject-similarity guard.
-    // Build an index of PR numbers → fork subjects that reference them.
-    // Only populated when prNumberMatching?.enabled is true.
-    const forkPrIndex = new Map<number, string[]>()
-    if (prNumberMatching?.enabled) {
-      try {
-        const subjectLog = git(["log", forkRef, "--format=%s", `--max-count=${FORK_LOG_DEPTH}`], cwd)
-        for (const subj of subjectLog.split("\n")) {
-          const trimmed = subj.trim()
-          if (!trimmed) continue
-          for (const m of trimmed.matchAll(/#(\d+)/g)) {
-            const num = parseInt(m[1], 10)
-            const bucket = forkPrIndex.get(num)
-            if (bucket) bucket.push(trimmed)
-            else forkPrIndex.set(num, [trimmed])
-          }
-        }
-      } catch {
-        // Non-fatal — fall back to the other three signals.
+  return rawCandidates.map((c) => {
+    if (c.alreadyApplied) return c
+
+    // Signal 1: exact subject match.
+    if (forkSubjects.has(c.subject)) return { ...c, alreadyApplied: true }
+
+    // Signal 2: upstream SHA referenced inside a fork commit message.
+    // A fork commit references this upstream SHA when one is a prefix of the
+    // other (handles both abbreviated 7-char refs and full 40-char SHAs).
+    const upSha = c.sha.toLowerCase()
+    for (const ref of forkShaRefs) {
+      if (upSha.startsWith(ref) || ref.startsWith(upSha)) {
+        return { ...c, alreadyApplied: true }
       }
     }
 
-    return rawCandidates.map((c) => {
-      if (c.alreadyApplied) return c
-
-      // Signal 1: exact subject match.
-      if (forkSubjects.has(c.subject)) return { ...c, alreadyApplied: true }
-
-      // Signal 2: upstream SHA referenced inside a fork commit message.
-      // A fork commit references this upstream SHA when one is a prefix of the
-      // other (handles both abbreviated 7-char refs and full 40-char SHAs).
-      const upSha = c.sha.toLowerCase()
-      for (const ref of forkShaRefs) {
-        if (upSha.startsWith(ref) || ref.startsWith(upSha)) {
+    // Signal 4: PR number present in both subjects, similarity above threshold.
+    if (prNumberMatching?.enabled) {
+      const upPrMatch = c.subject.match(/#(\d+)/)
+      if (upPrMatch) {
+        const prNum = parseInt(upPrMatch[1], 10)
+        const forkMatches = forkPrIndex.get(prNum)
+        if (
+          forkMatches?.some(
+            (s) => subjectSimilarity(c.subject, s) >= prNumberMatching.minSubjectSimilarity,
+          )
+        ) {
           return { ...c, alreadyApplied: true }
         }
       }
+    }
 
-      // Signal 4: PR number present in both subjects, similarity above threshold.
-      if (prNumberMatching?.enabled) {
-        const upPrMatch = c.subject.match(/#(\d+)/)
-        if (upPrMatch) {
-          const prNum = parseInt(upPrMatch[1], 10)
-          const forkMatches = forkPrIndex.get(prNum)
-          if (
-            forkMatches?.some(
-              (s) => subjectSimilarity(c.subject, s) >= prNumberMatching.minSubjectSimilarity,
-            )
-          ) {
-            return { ...c, alreadyApplied: true }
-          }
-        }
-      }
-
-      return c
-    })
-  }
+    return c
+  })
+}
 
 /**
  * Returns the list of file paths changed by a single commit, with status prefixes
@@ -5047,11 +5088,13 @@ export function ensureWorkingDir(config: SyncConfig): boolean {
  */
 
 import { z } from "zod"
+import { execFileSync } from "node:child_process"
 import { readFileSync, writeFileSync, unlinkSync, existsSync } from "node:fs"
-import { join as joinPath } from "node:path"
+import { dirname, join as joinPath } from "node:path"
 import { minimatch } from "minimatch"
 import { defineTool } from "../tool-helper.js"
 import {
+    git,
     ensureMergeBase,
     listCandidateCommits,
     getCommitChangedFiles,
@@ -5178,6 +5221,89 @@ function truncateCleanVersion(content: string, maxChars: number): string {
   return content.slice(0, maxChars) + `\n[... ${content.length - maxChars} chars omitted — file too large for context window ...]`
 }
 
+/**
+ * Extracts only the line ranges from a clean file version (forkVersion / upstreamVersion)
+ * that correspond to the conflict zones identified in the withMarkers version.
+ *
+ * Rationale: `forkVersion` and `upstreamVersion` contain the FULL file, but the LLM
+ * only needs the code around each conflict block.  For a 3 000-line file with two
+ * 20-line conflict regions, the old approach sent 60 000 chars (head-truncated);
+ * this approach sends ~2 × (20 + 2×50) lines ≈ 1–3 k chars — a 10–30× reduction.
+ *
+ * The line-number windows are derived from the `<<<<<<<` / `=======` / `>>>>>>>`
+ * markers in `withMarkersContent`.  Because the markers appear *inside* the ours
+ * block (and the theirs block follows after `=======`), the windows are a reasonable
+ * approximation for both sides even though their absolute line numbers differ slightly.
+ *
+ * @param cleanContent       - Full text of forkVersion or upstreamVersion.
+ * @param withMarkersContent - Working-tree file that contains conflict markers.
+ * @param maxChars           - Hard character cap applied after extraction.
+ * @param contextLines       - Lines of surrounding context kept on each side of a conflict block.
+ * @returns Extracted regions with `[... N lines omitted ...]` separators, or the
+ *          full content if it fits, or a head-truncation if no markers are found.
+ */
+function extractRegionsMatchingMarkers(
+  cleanContent: string,
+  withMarkersContent: string,
+  maxChars: number,
+  contextLines = 50,
+): string {
+  if (cleanContent.length <= maxChars) return cleanContent
+
+  // Identify line indices of conflict markers in the withMarkers file.
+  const markerLines = withMarkersContent.split("\n")
+  const conflictLineIndices: number[] = []
+  for (let i = 0; i < markerLines.length; i++) {
+    const t = markerLines[i].trimStart()
+    if (t.startsWith("<<<<<<<") || t.startsWith("=======") || t.startsWith(">>>>>>>")) {
+      conflictLineIndices.push(i)
+    }
+  }
+
+  if (conflictLineIndices.length === 0) {
+    // No markers found — fall back to head-truncation (shouldn't happen in practice).
+    return truncateCleanVersion(cleanContent, maxChars)
+  }
+
+  // Build merged windows from marker positions (same algorithm as extractConflictRegions).
+  const windows: Array<[number, number]> = []
+  for (const idx of conflictLineIndices) {
+    const start = Math.max(0, idx - contextLines)
+    const end = Math.min(markerLines.length - 1, idx + contextLines)
+    if (windows.length > 0 && start <= windows[windows.length - 1][1] + 1) {
+      windows[windows.length - 1][1] = Math.max(windows[windows.length - 1][1], end)
+    } else {
+      windows.push([start, end])
+    }
+  }
+
+  // Apply those windows to the clean version, clamping to its actual line count.
+  const cleanLines = cleanContent.split("\n")
+  const parts: string[] = []
+  let prevEnd = -1
+  for (const [start, end] of windows) {
+    const s = Math.min(start, cleanLines.length - 1)
+    const e = Math.min(end, cleanLines.length - 1)
+    if (prevEnd === -1 && s > 0) {
+      parts.push(`[... ${s} lines omitted ...]`)
+    } else if (prevEnd >= 0 && s > prevEnd + 1) {
+      parts.push(`[... ${s - prevEnd - 1} lines omitted ...]`)
+    }
+    parts.push(cleanLines.slice(s, e + 1).join("\n"))
+    prevEnd = e
+  }
+  if (prevEnd >= 0 && prevEnd < cleanLines.length - 1) {
+    parts.push(`[... ${cleanLines.length - 1 - prevEnd} lines omitted ...]`)
+  }
+
+  const result = parts.join("\n")
+  // Safety cap: if the extracted result is still too large, head-truncate it.
+  if (result.length > maxChars) {
+    return result.slice(0, maxChars) + `\n[... truncated at ${maxChars} chars ...]`
+  }
+  return result
+}
+
 export function makeGitTools(config: SyncConfig) {
   // Destructure frequently-used config sections for brevity inside each tool.
   const { workingDir, upstream, fork, sync } = config
@@ -5251,6 +5377,7 @@ export function makeGitTools(config: SyncConfig) {
         workingDir,
         `${upstream.remote}/${upstream.branch}`,
         `${fork.remote}/${fork.branch}`,
+        upstream.cutDate ? new Date(upstream.cutDate) : undefined,
         sync.prNumberMatching.enabled ? sync.prNumberMatching : undefined,
       )
 
@@ -5357,6 +5484,55 @@ export function makeGitTools(config: SyncConfig) {
       if (sync.dryRun) return { success: true, dryRun: true, conflictedFiles: [] }
       currentPickSha = sha
       const result = cherryPick(workingDir, sha)
+
+      // Auto-resolve bun.lock / bun.lockb conflicts by regenerating via `bun install`.
+      // These files are binary-adjacent auto-generated artifacts — AI merging is pointless.
+      // Strategy: delete the conflicted file and let `bun install` regenerate it from the
+      // already-merged package.json files, then stage the result.
+      if (!result.success && result.conflictedFiles.length > 0) {
+        const bunLockFiles = result.conflictedFiles.filter(
+          (f) => f === "bun.lock" || f === "bun.lockb" || f.endsWith("/bun.lock") || f.endsWith("/bun.lockb"),
+        )
+        if (bunLockFiles.length > 0) {
+          for (const lockFile of bunLockFiles) {
+            const lockAbsPath = joinPath(workingDir, lockFile)
+            const lockDir = lockFile.includes("/") ? joinPath(workingDir, dirname(lockFile)) : workingDir
+            try {
+              // Delete the conflicted lock file so bun regenerates from scratch.
+              if (existsSync(lockAbsPath)) unlinkSync(lockAbsPath)
+              execFileSync("bun", ["install"], {
+                cwd: lockDir,
+                encoding: "utf-8",
+                stdio: ["pipe", "pipe", "pipe"],
+              })
+              git(["add", lockFile], workingDir)
+              process.stderr.write(`[bun.lock] Auto-regenerated ${lockFile} via bun install\n`)
+            } catch (err) {
+              process.stderr.write(`[bun.lock] Warning: failed to regenerate ${lockFile}: ${err}\n`)
+              // Leave in conflictedFiles so the agent can decide what to do.
+              continue
+            }
+          }
+          // Remove successfully regenerated lock files from the conflict list.
+          result.conflictedFiles = result.conflictedFiles.filter(
+            (f) => !bunLockFiles.includes(f),
+          )
+        }
+
+        // If bun.lock was the only conflict and it's now resolved, finalize the cherry-pick.
+        if (result.conflictedFiles.length === 0) {
+          try {
+            continueCherryPick(workingDir)
+            result.success = true
+            process.stderr.write(`[bun.lock] Cherry-pick completed after lock file regeneration\n`)
+          } catch (err) {
+            process.stderr.write(`[bun.lock] Warning: continue-cherry-pick failed after lock regeneration: ${err}\n`)
+            // Revert to conflict state so the agent can investigate.
+            result.success = false
+          }
+        }
+      }
+
       if (result.success) {
         checkpointAppliedShas.push(sha)
         currentPickSha = null
@@ -5429,14 +5605,26 @@ export function makeGitTools(config: SyncConfig) {
       }
 
       // Apply per-version character limits to prevent context-window overflow for
-      // large auto-generated files (e.g. model catalogs, lock files).
-      // withMarkers is truncated by extracting only the conflict-marker regions
-      // (with surrounding context lines); forkVersion / upstreamVersion are
-      // head-truncated since they have no markers to guide extraction.
+      // large files (e.g. SdkController.ts, message-translator.ts).
+      // withMarkers uses extractConflictRegions (marker-guided windowing).
+      // forkVersion / upstreamVersion use extractRegionsMatchingMarkers: the conflict
+      // zones identified in withMarkers are used as a proxy to select the relevant
+      // line ranges from each clean version, avoiding sending the whole file.
+      // This can cut context 10–30× for large files with small conflict zones.
       const maxChars = sync.maxConflictContextChars
-      const forkVersion = rawForkVersion !== null ? truncateCleanVersion(rawForkVersion, maxChars) : null
-      const upstreamVersion = rawUpstreamVersion !== null ? truncateCleanVersion(rawUpstreamVersion, maxChars) : null
       const withMarkers = rawWithMarkers !== null ? extractConflictRegions(rawWithMarkers, maxChars) : null
+      const forkVersion =
+        rawForkVersion !== null
+          ? rawWithMarkers !== null
+            ? extractRegionsMatchingMarkers(rawForkVersion, rawWithMarkers, maxChars)
+            : truncateCleanVersion(rawForkVersion, maxChars)
+          : null
+      const upstreamVersion =
+        rawUpstreamVersion !== null
+          ? rawWithMarkers !== null
+            ? extractRegionsMatchingMarkers(rawUpstreamVersion, rawWithMarkers, maxChars)
+            : truncateCleanVersion(rawUpstreamVersion, maxChars)
+          : null
 
       const truncated =
         (rawForkVersion !== null && forkVersion !== rawForkVersion) ||
@@ -5444,8 +5632,13 @@ export function makeGitTools(config: SyncConfig) {
         (rawWithMarkers !== null && withMarkers !== rawWithMarkers)
 
       if (truncated) {
+        const forkChars = forkVersion?.length ?? 0
+        const upstreamChars = upstreamVersion?.length ?? 0
+        const markersChars = withMarkers?.length ?? 0
         process.stderr.write(
-          `[Context] get_conflict_context: truncated large file "${filePath}" to ${maxChars} chars/version\n`,
+          `[Context] get_conflict_context: extracted regions for "${filePath}"` +
+          ` — fork:${forkChars}c upstream:${upstreamChars}c markers:${markersChars}c` +
+          ` (was up to ${maxChars}c per version)\n`,
         )
       }
 
@@ -5917,19 +6110,19 @@ export function makeGitHubTools(config: SyncConfig) {
  *  vault-based key rotation via `KEYPOOL_VAULT_URL`.
  */
 /// <reference types="node" />
-import { existsSync, mkdirSync, readFileSync } from "node:fs"
-import { resolve as resolvePath, join as joinPath } from "node:path"
-import { parseCliArgs } from "./cli/args.js"
-import { loadConfig } from "./config/loader.js"
-import { applyGitAuth, ensureWorkingDir } from "./git/git-init.js"
-import { ensureMergeBase, fetchRemotes, listCandidateCommits } from "./git/git-client.js"
-import { buildNoopSyncReport } from "./reports/noop-report.js"
-import { buildContextAbortReport } from "./reports/context-abort-report.js"
-import { setupAgent } from "./agent/agent-setup.js"
-import { setupEventHandlers } from "./agent/event-handlers.js"
-import { runWithRetry } from "./agent/retry-logic.js"
-import { CHECKPOINT_FILENAME } from "./git/git-tools.js"
-import type { SyncConfig } from "./config/schema.js"
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { resolve as resolvePath, join as joinPath } from "node:path";
+import { parseCliArgs } from "./cli/args.js";
+import { loadConfig } from "./config/loader.js";
+import { applyGitAuth, ensureWorkingDir } from "./git/git-init.js";
+import { ensureMergeBase, fetchRemotes, listCandidateCommits } from "./git/git-client.js";
+import { buildNoopSyncReport } from "./reports/noop-report.js";
+import { buildContextAbortReport } from "./reports/context-abort-report.js";
+import { setupAgent } from "./agent/agent-setup.js";
+import { setupEventHandlers } from "./agent/event-handlers.js";
+import { runWithRetry } from "./agent/retry-logic.js";
+import { CHECKPOINT_FILENAME } from "./git/git-tools.js";
+import type { SyncConfig } from "./config/schema.js";
 
 /**
  * Gets the sync branch name from the environment variable if available, otherwise generates
@@ -6109,6 +6302,7 @@ async function main() {
     config.workingDir,
     upstreamRef,
     forkRef,
+    config.upstream.cutDate ? new Date(config.upstream.cutDate) : undefined,
     config.sync.prNumberMatching.enabled ? config.sync.prNumberMatching : undefined,
   )
 
@@ -6120,7 +6314,7 @@ async function main() {
     } else {
       console.log(`${pending.length} commit(s) pending backport from ${upstreamRef} into ${forkRef} (oldest first):\n`)
       for (const c of pending) {
-        console.log(`${c.sha}  ${c.subject}`)
+        console.log(`${c.date.toISOString()}   ${c.sha}  ${c.subject}`)
       }
     }
     return
@@ -6558,14 +6752,14 @@ export function buildNoopSyncReport({
  *  8. AI sub-agent call log — full prompt/response transcript from the JSONL log.
  */
 
-import { z } from "zod"
-import { readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync } from "node:fs"
-import { resolve as resolvePath, join as joinPath, relative as relativePath } from "node:path"
-import { git } from "../git/git-client.js"
-import { CHECKPOINT_FILENAME } from "../git/git-tools.js"
-import { Agent } from "@sctg/cline-sdk"
-import { defineTool } from "../tool-helper.js"
-import type { SyncConfig } from "../config/schema.js"
+import { z } from "zod";
+import { readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync } from "node:fs";
+import { resolve as resolvePath, join as joinPath, relative as relativePath } from "node:path";
+import { git } from "../git/git-client.js";
+import { CHECKPOINT_FILENAME } from "../git/git-tools.js";
+import { Agent } from "@sctg/cline-sdk";
+import { defineTool } from "../tool-helper.js";
+import type { SyncConfig } from "../config/schema.js";
 
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -6863,6 +7057,7 @@ export function makeReportTool(
         "",
         `**Date**: ${date}`,
         `**Upstream ref**: \`${upstreamRef}\``,
+        `**Cut date**: ${config.upstream.cutDate ? `\`${config.upstream.cutDate}\`` : "_none (all commits considered)_"} `,
         `**Fork ref**: \`${forkRef}\``,
         `**Sync branch**: ${syncBranch ? `\`${syncBranch}\`` : "_dry-run (no branch created)_"}`,
         "",
