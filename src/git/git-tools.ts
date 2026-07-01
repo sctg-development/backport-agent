@@ -331,6 +331,7 @@ export function makeGitTools(config: SyncConfig) {
         workingDir,
         `${upstream.remote}/${upstream.branch}`,
         `${fork.remote}/${fork.branch}`,
+        upstream.cutDate ? new Date(upstream.cutDate) : undefined,
         sync.prNumberMatching.enabled ? sync.prNumberMatching : undefined,
       )
 
