@@ -42,11 +42,13 @@
  */
 
 import { z } from "zod"
+import { execFileSync } from "node:child_process"
 import { readFileSync, writeFileSync, unlinkSync, existsSync } from "node:fs"
-import { join as joinPath } from "node:path"
+import { dirname, join as joinPath } from "node:path"
 import { minimatch } from "minimatch"
 import { defineTool } from "../tool-helper.js"
 import {
+    git,
     ensureMergeBase,
     listCandidateCommits,
     getCommitChangedFiles,
@@ -171,6 +173,89 @@ function extractConflictRegions(content: string, maxChars: number, contextLines 
 function truncateCleanVersion(content: string, maxChars: number): string {
   if (content.length <= maxChars) return content
   return content.slice(0, maxChars) + `\n[... ${content.length - maxChars} chars omitted — file too large for context window ...]`
+}
+
+/**
+ * Extracts only the line ranges from a clean file version (forkVersion / upstreamVersion)
+ * that correspond to the conflict zones identified in the withMarkers version.
+ *
+ * Rationale: `forkVersion` and `upstreamVersion` contain the FULL file, but the LLM
+ * only needs the code around each conflict block.  For a 3 000-line file with two
+ * 20-line conflict regions, the old approach sent 60 000 chars (head-truncated);
+ * this approach sends ~2 × (20 + 2×50) lines ≈ 1–3 k chars — a 10–30× reduction.
+ *
+ * The line-number windows are derived from the `<<<<<<<` / `=======` / `>>>>>>>`
+ * markers in `withMarkersContent`.  Because the markers appear *inside* the ours
+ * block (and the theirs block follows after `=======`), the windows are a reasonable
+ * approximation for both sides even though their absolute line numbers differ slightly.
+ *
+ * @param cleanContent       - Full text of forkVersion or upstreamVersion.
+ * @param withMarkersContent - Working-tree file that contains conflict markers.
+ * @param maxChars           - Hard character cap applied after extraction.
+ * @param contextLines       - Lines of surrounding context kept on each side of a conflict block.
+ * @returns Extracted regions with `[... N lines omitted ...]` separators, or the
+ *          full content if it fits, or a head-truncation if no markers are found.
+ */
+function extractRegionsMatchingMarkers(
+  cleanContent: string,
+  withMarkersContent: string,
+  maxChars: number,
+  contextLines = 50,
+): string {
+  if (cleanContent.length <= maxChars) return cleanContent
+
+  // Identify line indices of conflict markers in the withMarkers file.
+  const markerLines = withMarkersContent.split("\n")
+  const conflictLineIndices: number[] = []
+  for (let i = 0; i < markerLines.length; i++) {
+    const t = markerLines[i].trimStart()
+    if (t.startsWith("<<<<<<<") || t.startsWith("=======") || t.startsWith(">>>>>>>")) {
+      conflictLineIndices.push(i)
+    }
+  }
+
+  if (conflictLineIndices.length === 0) {
+    // No markers found — fall back to head-truncation (shouldn't happen in practice).
+    return truncateCleanVersion(cleanContent, maxChars)
+  }
+
+  // Build merged windows from marker positions (same algorithm as extractConflictRegions).
+  const windows: Array<[number, number]> = []
+  for (const idx of conflictLineIndices) {
+    const start = Math.max(0, idx - contextLines)
+    const end = Math.min(markerLines.length - 1, idx + contextLines)
+    if (windows.length > 0 && start <= windows[windows.length - 1][1] + 1) {
+      windows[windows.length - 1][1] = Math.max(windows[windows.length - 1][1], end)
+    } else {
+      windows.push([start, end])
+    }
+  }
+
+  // Apply those windows to the clean version, clamping to its actual line count.
+  const cleanLines = cleanContent.split("\n")
+  const parts: string[] = []
+  let prevEnd = -1
+  for (const [start, end] of windows) {
+    const s = Math.min(start, cleanLines.length - 1)
+    const e = Math.min(end, cleanLines.length - 1)
+    if (prevEnd === -1 && s > 0) {
+      parts.push(`[... ${s} lines omitted ...]`)
+    } else if (prevEnd >= 0 && s > prevEnd + 1) {
+      parts.push(`[... ${s - prevEnd - 1} lines omitted ...]`)
+    }
+    parts.push(cleanLines.slice(s, e + 1).join("\n"))
+    prevEnd = e
+  }
+  if (prevEnd >= 0 && prevEnd < cleanLines.length - 1) {
+    parts.push(`[... ${cleanLines.length - 1 - prevEnd} lines omitted ...]`)
+  }
+
+  const result = parts.join("\n")
+  // Safety cap: if the extracted result is still too large, head-truncate it.
+  if (result.length > maxChars) {
+    return result.slice(0, maxChars) + `\n[... truncated at ${maxChars} chars ...]`
+  }
+  return result
 }
 
 export function makeGitTools(config: SyncConfig) {
@@ -352,6 +437,55 @@ export function makeGitTools(config: SyncConfig) {
       if (sync.dryRun) return { success: true, dryRun: true, conflictedFiles: [] }
       currentPickSha = sha
       const result = cherryPick(workingDir, sha)
+
+      // Auto-resolve bun.lock / bun.lockb conflicts by regenerating via `bun install`.
+      // These files are binary-adjacent auto-generated artifacts — AI merging is pointless.
+      // Strategy: delete the conflicted file and let `bun install` regenerate it from the
+      // already-merged package.json files, then stage the result.
+      if (!result.success && result.conflictedFiles.length > 0) {
+        const bunLockFiles = result.conflictedFiles.filter(
+          (f) => f === "bun.lock" || f === "bun.lockb" || f.endsWith("/bun.lock") || f.endsWith("/bun.lockb"),
+        )
+        if (bunLockFiles.length > 0) {
+          for (const lockFile of bunLockFiles) {
+            const lockAbsPath = joinPath(workingDir, lockFile)
+            const lockDir = lockFile.includes("/") ? joinPath(workingDir, dirname(lockFile)) : workingDir
+            try {
+              // Delete the conflicted lock file so bun regenerates from scratch.
+              if (existsSync(lockAbsPath)) unlinkSync(lockAbsPath)
+              execFileSync("bun", ["install"], {
+                cwd: lockDir,
+                encoding: "utf-8",
+                stdio: ["pipe", "pipe", "pipe"],
+              })
+              git(["add", lockFile], workingDir)
+              process.stderr.write(`[bun.lock] Auto-regenerated ${lockFile} via bun install\n`)
+            } catch (err) {
+              process.stderr.write(`[bun.lock] Warning: failed to regenerate ${lockFile}: ${err}\n`)
+              // Leave in conflictedFiles so the agent can decide what to do.
+              continue
+            }
+          }
+          // Remove successfully regenerated lock files from the conflict list.
+          result.conflictedFiles = result.conflictedFiles.filter(
+            (f) => !bunLockFiles.includes(f),
+          )
+        }
+
+        // If bun.lock was the only conflict and it's now resolved, finalize the cherry-pick.
+        if (result.conflictedFiles.length === 0) {
+          try {
+            continueCherryPick(workingDir)
+            result.success = true
+            process.stderr.write(`[bun.lock] Cherry-pick completed after lock file regeneration\n`)
+          } catch (err) {
+            process.stderr.write(`[bun.lock] Warning: continue-cherry-pick failed after lock regeneration: ${err}\n`)
+            // Revert to conflict state so the agent can investigate.
+            result.success = false
+          }
+        }
+      }
+
       if (result.success) {
         checkpointAppliedShas.push(sha)
         currentPickSha = null
@@ -424,14 +558,26 @@ export function makeGitTools(config: SyncConfig) {
       }
 
       // Apply per-version character limits to prevent context-window overflow for
-      // large auto-generated files (e.g. model catalogs, lock files).
-      // withMarkers is truncated by extracting only the conflict-marker regions
-      // (with surrounding context lines); forkVersion / upstreamVersion are
-      // head-truncated since they have no markers to guide extraction.
+      // large files (e.g. SdkController.ts, message-translator.ts).
+      // withMarkers uses extractConflictRegions (marker-guided windowing).
+      // forkVersion / upstreamVersion use extractRegionsMatchingMarkers: the conflict
+      // zones identified in withMarkers are used as a proxy to select the relevant
+      // line ranges from each clean version, avoiding sending the whole file.
+      // This can cut context 10–30× for large files with small conflict zones.
       const maxChars = sync.maxConflictContextChars
-      const forkVersion = rawForkVersion !== null ? truncateCleanVersion(rawForkVersion, maxChars) : null
-      const upstreamVersion = rawUpstreamVersion !== null ? truncateCleanVersion(rawUpstreamVersion, maxChars) : null
       const withMarkers = rawWithMarkers !== null ? extractConflictRegions(rawWithMarkers, maxChars) : null
+      const forkVersion =
+        rawForkVersion !== null
+          ? rawWithMarkers !== null
+            ? extractRegionsMatchingMarkers(rawForkVersion, rawWithMarkers, maxChars)
+            : truncateCleanVersion(rawForkVersion, maxChars)
+          : null
+      const upstreamVersion =
+        rawUpstreamVersion !== null
+          ? rawWithMarkers !== null
+            ? extractRegionsMatchingMarkers(rawUpstreamVersion, rawWithMarkers, maxChars)
+            : truncateCleanVersion(rawUpstreamVersion, maxChars)
+          : null
 
       const truncated =
         (rawForkVersion !== null && forkVersion !== rawForkVersion) ||
@@ -439,8 +585,13 @@ export function makeGitTools(config: SyncConfig) {
         (rawWithMarkers !== null && withMarkers !== rawWithMarkers)
 
       if (truncated) {
+        const forkChars = forkVersion?.length ?? 0
+        const upstreamChars = upstreamVersion?.length ?? 0
+        const markersChars = withMarkers?.length ?? 0
         process.stderr.write(
-          `[Context] get_conflict_context: truncated large file "${filePath}" to ${maxChars} chars/version\n`,
+          `[Context] get_conflict_context: extracted regions for "${filePath}"` +
+          ` — fork:${forkChars}c upstream:${upstreamChars}c markers:${markersChars}c` +
+          ` (was up to ${maxChars}c per version)\n`,
         )
       }
 

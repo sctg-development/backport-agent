@@ -67,6 +67,9 @@ Produce a draft pull request with a clear report. Never push directly to the mai
             → add to blockedCommits with a precise reason from the AI analysis.
           - If uncertain: still attempt the cherry-pick; conflicts will surface in step 5c.
    d. Commits with alreadyApplied: true → record as "skipped" in commitResults.
+   e. bun.lock / bun.lockb conflicts → auto-resolved by the cherry_pick_commit tool: the lock file is
+      deleted and regenerated via "bun install" automatically. You will NOT see these in conflictedFiles.
+      For other lock files (package-lock.json, yarn.lock, pnpm-lock.yaml), prefer regenerating manually.
 4. Create the sync branch via create_sync_branch (once, before first cherry-pick).
 5. For each non-skipped commit (process lowest risk first):
    a. Call cherry_pick_commit.

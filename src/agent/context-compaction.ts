@@ -126,27 +126,20 @@ export function serializeMessages(messages: readonly AgentMessage[]): string {
 // ---------------------------------------------------------------------------
 
 /**
- * Resolve the provider/model/key to use for compaction.
- * Falls back to `models.specialist` with the same provider if `models.summarizer` is absent.
+ * Resolve the provider/model/key to use for compaction and last-resort conflict resolution.
+ * Uses the same provider and API key as the main agent so it works out of the box with
+ * keypoollive (which routes `gemini/gemini-3-flash-preview` automatically).
  */
 export function getSummarizerConfig(config: SyncConfig): SummarizerConfig {
-  if (config.models.summarizer) {
-    const { provider, modelId, apiKey } = config.models.summarizer
-    // If apiKey is an env-var reference (starts with "$"), resolve it.
-    const resolvedKey = apiKey?.startsWith("$") ? process.env[apiKey.slice(1)] : apiKey
-    return { providerId: provider, modelId, apiKey: resolvedKey }
-  }
-  // Fallback: use specialist model with the same provider and API key as the main agent.
-  // Note: the main API key is accessed via config; provider.ts resolution happens upstream.
-  const fallbackKey = config.models.apiKey === "auto"
+  const apiKey = config.models.apiKey === "auto"
     ? undefined
     : config.models.apiKey?.startsWith("$")
       ? process.env[config.models.apiKey.slice(1)]
       : config.models.apiKey
   return {
     providerId: config.models.provider,
-    modelId: config.models.specialist,
-    apiKey: fallbackKey,
+    modelId: config.models.summarizer,
+    apiKey,
   }
 }
 

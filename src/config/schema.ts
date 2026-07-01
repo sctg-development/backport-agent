@@ -359,23 +359,16 @@ export const SyncConfigSchema = z.object({
         .default("mistral/magistral-medium-latest")
         .describe("High-capability model for conflict resolution (fallback)"),
       /**
-       * Optional model used exclusively for context compaction (the `prepareTurn` hook).
-       * Must have a large enough context window to ingest the full conversation transcript
-       * (~200k tokens) — Gemini 2.5 Flash (1M context) is the recommended choice.
-       * If absent, falls back to `models.specialist` with the same provider.
-       *
-       * With keypoollive vault:
-       *   { "provider": "keypoollive", "modelId": "gemini/gemini-2.5-flash-preview" }
-       * With direct Gemini API key:
-       *   { "provider": "gemini", "modelId": "gemini-2.5-flash-preview", "apiKey": "$GEMINI_API_KEY" }
+       * Last-resort model for context compaction (`prepareTurn` hook) and for resolving
+       * conflicts that are unsolvable without a very large context window.
+       * Must support at least 1M tokens — Gemini 3 Flash is the recommended choice.
+       * Uses the same provider and API key as the main agent (works out of the box
+       * with keypoollive, which routes `gemini/gemini-3-flash-preview` automatically).
        */
       summarizer: z
-        .object({
-          provider: z.string(),
-          modelId: z.string(),
-          apiKey: z.string().optional(),
-        })
-        .optional(),
+        .string()
+        .default("gemini/gemini-3-flash-preview")
+        .describe("Big context model (1M+ tokens) used as last resort for compaction and hard conflicts"),
     })
     // Allow omitting the entire models block; individual fields carry defaults.
     .default(() => ({} as any)),
