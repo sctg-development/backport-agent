@@ -34,9 +34,9 @@
   },
   "dependencies": {
     "@octokit/rest": "^22.0.1",
-    "@sctg/cline-sdk": "4.0.0-beta.20260630185625",
+    "@sctg/cline-sdk": "4.0.0-beta.20260706210016",
     "dotenv": "^17.4.2",
-    "js-yaml": "^5.2.0",
+    "js-yaml": "^5.2.1",
     "minimatch": "^10.0.1",
     "tiktoken": "^1.0.22",
     "zod": "^4.4.3"
@@ -45,10 +45,10 @@
     "@types/js-yaml": "^4.0.9",
     "@types/node": "^22.20.0",
     "fast-glob": "^3.3.3",
-    "tsx": "^4.22.4",
+    "tsx": "^4.23.0",
     "typescript": "^6.0.3",
-    "vite": "^8.1.0",
-    "vitest": "^4.1.9"
+    "vite": "^8.1.3",
+    "vitest": "^4.1.10"
   },
   "publishConfig": {
     "access": "public"
