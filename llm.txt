@@ -1,4 +1,4 @@
-Backport-agent e-commerce framework — source index (2026-07-01)
+Backport-agent e-commerce framework — source index (2026-07-09)
 Stack: Cline SDK with name @sctg/cline-sdk
 
 FILES
@@ -6,6 +6,7 @@ FILES
   src/agent/context-compaction.ts
   src/agent/event-handlers.ts
   src/agent/retry-logic.ts
+  src/agent/run-state.ts
   src/agent/system-prompt.ts
   src/ai/ai-tools.ts
   src/cli/args.ts

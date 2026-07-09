@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Daily backport-agent sync (07:15 every day).
+
+  Install:
+    cp backport-agent/scripts/org.sctg.backport-agent.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/org.sctg.backport-agent.plist
+
+  Uninstall:
+    launchctl unload ~/Library/LaunchAgents/org.sctg.backport-agent.plist
+    rm ~/Library/LaunchAgents/org.sctg.backport-agent.plist
+
+  Trigger a run immediately:
+    launchctl start org.sctg.backport-agent
+
+  Logs: ~/Library/Logs/backport-agent/sync-*.log
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>org.sctg.backport-agent</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/rlemeill/Development/cline/backport-agent/scripts/run-daily-sync.sh</string>
+    </array>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>7</integer>
+        <key>Minute</key>
+        <integer>15</integer>
+    </dict>
+
+    <!-- If the Mac was asleep at 07:15, run at next wake instead of skipping. -->
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/rlemeill/Library/Logs/backport-agent/launchd.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/rlemeill/Library/Logs/backport-agent/launchd.err.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>Nice</key>
+    <integer>5</integer>
+</dict>
+</plist>

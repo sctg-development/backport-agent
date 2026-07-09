@@ -66,6 +66,7 @@ import { Agent } from "@sctg/cline-sdk"
 import { defineTool } from "../tool-helper.js"
 import type { SyncConfig } from "../config/schema.js"
 import type { Customizations } from "../customizations/schema.js"
+import type { RunState } from "../agent/run-state.js"
 import { getCommitDiff } from "../git/git-client.js"
 import { globSync } from "node:fs"
 import { join as joinPath } from "node:path"
@@ -485,6 +486,8 @@ function makeSubAgent(
  * @param apiKey          - Resolved API key (from config or env); `undefined` for SDK auto-discovery.
  * @param customizations  - Loaded customizations manifest; used to enrich conflict resolution
  *                          prompts with fork-specific context when the caller provides IDs.
+ * @param runState        - Host-side run state; resolution confidences are recorded here so
+ *                          `apply_resolved_file` can enforce `config.ai.minAutoApplyConfidence`.
  * @returns Array of four agent tools for AI-assisted analysis.
  */
 export function makeAiTools(
@@ -494,6 +497,7 @@ export function makeAiTools(
   apiKey: string | undefined,
   customizations?: Customizations,
   keypoolEventHandler?: KeypoolEventHandler,
+  runState?: RunState,
 ) {
   // -------------------------------------------------------------------------
   // Tool 1: resolve_conflict_with_ai
@@ -783,6 +787,11 @@ export function makeAiTools(
             effectiveConfidence,
             guards,
           })
+
+          // Record the effective confidence host-side so apply_resolved_file can
+          // enforce config.ai.minAutoApplyConfidence regardless of what the
+          // orchestrator model decides to do with this result.
+          runState?.resolutions.set(filePath, { confidence: effectiveConfidence, guards })
 
           return {
             resolvedContent: output.resolvedContent,

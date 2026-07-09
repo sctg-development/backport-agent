@@ -47,6 +47,7 @@ import { z } from "zod"
 import { defineTool } from "../tool-helper.js"
 import { Octokit } from "@octokit/rest"
 import type { SyncConfig } from "../config/schema.js"
+import { recordGateEvent, validationFailed, validationRan, type RunState } from "../agent/run-state.js"
 
 /**
  * Creates and returns an authenticated Octokit instance using the `GITHUB_TOKEN`
@@ -98,6 +99,65 @@ const STATE_MARKER_START = "<!-- backport-agent-state\n"
 const STATE_MARKER_END = "\n-->"
 
 /**
+ * Host-side helper: create the sync PR for `branchName`, or update the body of
+ * the existing open PR for that branch.
+ *
+ * Called deterministically by `generate_report` (when `config.sync.createPullRequest`
+ * is enabled) so that PR creation no longer depends on the orchestrator model
+ * remembering to call the `create_sync_pr` tool after the terminal report step.
+ *
+ * @param config       - Validated `SyncConfig`.
+ * @param branchName   - Head branch of the PR (the sync branch that was pushed).
+ * @param markdownBody - Human-readable PR body (the run report).
+ * @param agentState   - Machine-readable state embedded as a hidden HTML comment.
+ * @returns PR url/number and whether it was created or updated.
+ * @throws If `GITHUB_TOKEN` is missing or the GitHub API call fails.
+ */
+export async function createOrUpdateSyncPr(
+  config: SyncConfig,
+  branchName: string,
+  markdownBody: string,
+  agentState: Record<string, unknown>,
+): Promise<{ url: string; number: number; created: boolean }> {
+  const octokit = makeOctokit()
+  const { owner, repo } = parseRepo(config.fork.repo)
+  const date = new Date().toISOString().slice(0, 10)
+
+  const hiddenState = `${STATE_MARKER_START}${JSON.stringify(agentState, null, 2)}${STATE_MARKER_END}`
+  const body = `${markdownBody}\n\n${hiddenState}`
+
+  // Reuse the PR already open for this head branch when there is one.
+  const { data: existing } = await octokit.pulls.list({
+    owner,
+    repo,
+    state: "open",
+    head: `${owner}:${branchName}`,
+    per_page: 1,
+  })
+  if (existing.length > 0) {
+    const pr = existing[0]
+    await octokit.pulls.update({ owner, repo, pull_number: pr.number, body })
+    return { url: pr.html_url, number: pr.number, created: false }
+  }
+
+  const { data: pr } = await octokit.pulls.create({
+    owner,
+    repo,
+    title: `Sync upstream ${config.upstream.branch} into ${config.fork.branch} (${date})`,
+    body,
+    head: branchName,
+    base: config.fork.branch,
+    draft: true,
+  })
+  try {
+    await octokit.issues.addLabels({ owner, repo, issue_number: pr.number, labels: ["sync", "agent-generated"] })
+  } catch {
+    // Non-fatal: labels are cosmetic.
+  }
+  return { url: pr.html_url, number: pr.number, created: true }
+}
+
+/**
  * Builds and returns the three GitHub API agent tools.
  *
  * All tools capture `fork`, `upstream`, and `sync` from the config via closure.
@@ -107,7 +167,7 @@ const STATE_MARKER_END = "\n-->"
  * @param config - Validated `SyncConfig` loaded from `config.json`.
  * @returns Array of three agent tools: `[findExistingPrTool, createSyncPrTool, addHumanReviewCommentTool]`.
  */
-export function makeGitHubTools(config: SyncConfig) {
+export function makeGitHubTools(config: SyncConfig, runState?: RunState) {
   // Destructure the config sections needed by the tools.
   const { fork, upstream, sync } = config
 
@@ -285,6 +345,20 @@ export function makeGitHubTools(config: SyncConfig) {
       if (sync.dryRun) return { merged: false, dryRun: true }
       if (!sync.autoMergeOnSuccess) {
         return { merged: false, disabled: true, reason: "autoMergeOnSuccess is not enabled in config" }
+      }
+
+      // --- Host-side merge gates (enforced in code, not just in the prompt) ---
+      // Auto-merge is the only step that can land changes on the fork main branch,
+      // so it must never proceed on a run whose validation failed or never ran.
+      if (runState) {
+        if (validationFailed(runState)) {
+          recordGateEvent(runState, `auto_merge_pr refused for PR #${prNumber}: validation suite failed during this run`)
+          return { merged: false, blocked: true, reason: "Blocked by host gate: validation failed during this run" }
+        }
+        if (!validationRan(runState)) {
+          recordGateEvent(runState, `auto_merge_pr refused for PR #${prNumber}: run_validation was never called`)
+          return { merged: false, blocked: true, reason: "Blocked by host gate: run_validation was never called in this run" }
+        }
       }
 
       const octokit = makeOctokit()

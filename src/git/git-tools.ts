@@ -63,6 +63,7 @@ import {
     fetchRemotes,
 } from "./git-client.js"
 import type { SyncConfig } from "../config/schema.js"
+import { meetsConfidence, recordGateEvent, validationFailed, type RunState } from "../agent/run-state.js"
 
 /**
  * Tests whether a repo-relative file path matches any of the given patterns.
@@ -258,7 +259,7 @@ function extractRegionsMatchingMarkers(
   return result
 }
 
-export function makeGitTools(config: SyncConfig) {
+export function makeGitTools(config: SyncConfig, runState?: RunState) {
   // Destructure frequently-used config sections for brevity inside each tool.
   const { workingDir, upstream, fork, sync } = config
 
@@ -611,7 +612,9 @@ export function makeGitTools(config: SyncConfig) {
     name: "apply_resolved_file",
     description:
       "Write the resolved content for a conflicted file and stage it. " +
-      "Call this for each conflicted file before calling continue_cherry_pick.",
+      "Call this for each conflicted file before calling continue_cherry_pick. " +
+      "Refuses AI resolutions whose confidence is below config.ai.minAutoApplyConfidence — " +
+      "in that case call abort_cherry_pick and mark the commit conflict-blocked.",
     inputSchema: z.object({
       filePath: z.string().describe("Repo-relative path of the file"),
       resolvedContent: z.string().describe("The fully resolved file content, with no conflict markers"),
@@ -619,6 +622,35 @@ export function makeGitTools(config: SyncConfig) {
     execute: async ({ filePath, resolvedContent }) => {
       // Skip file write in dry-run mode.
       if (sync.dryRun) return { staged: false, dryRun: true }
+
+      // --- Host-side confidence gate (wires config.ai.minAutoApplyConfidence) ---
+      // If this file went through resolve_conflict_with_ai, its effective confidence
+      // was recorded in the run state.  Refuse to write when it is below the
+      // configured minimum, no matter what the orchestrator model decided.
+      // Files resolved via a forced strategy (resolve.ours/theirs) have no record
+      // and are not gated.
+      if (runState) {
+        const record = runState.resolutions.get(filePath)
+        const minimum = config.ai.minAutoApplyConfidence
+        if (record && !meetsConfidence(record.confidence, minimum)) {
+          recordGateEvent(
+            runState,
+            `apply_resolved_file refused for ${filePath}: AI confidence "${record.confidence}"` +
+              ` is below minAutoApplyConfidence "${minimum}"` +
+              (record.guards.length > 0 ? ` (guards: ${record.guards.join(", ")})` : ""),
+          )
+          return {
+            staged: false,
+            blocked: true,
+            filePath,
+            reason:
+              `Blocked by host gate: AI resolution confidence "${record.confidence}" is below ` +
+              `the configured minimum "${minimum}". Call abort_cherry_pick and mark this commit ` +
+              `conflict-blocked for human review.`,
+          }
+        }
+      }
+
       writeAndStageFile(workingDir, filePath, resolvedContent)
       return { staged: true, filePath }
     },
@@ -666,8 +698,21 @@ export function makeGitTools(config: SyncConfig) {
     execute: async ({ branchName }) => {
       // Skip push in dry-run mode.
       if (sync.dryRun) return { pushed: false, dryRun: true }
+
+      // The sync branch is intentionally pushed even when validation failed —
+      // it never touches the fork main branch and preserves the run's work for
+      // human inspection — but the failure is flagged so the report and exit
+      // code cannot present this run as clean.
+      const pushedDespiteValidationFailure = runState ? validationFailed(runState) : false
+      if (pushedDespiteValidationFailure && runState) {
+        recordGateEvent(
+          runState,
+          `push_sync_branch pushed "${branchName}" with a FAILED validation suite — run requires human review`,
+        )
+      }
+
       pushBranch(workingDir, fork.remote, branchName)
-      return { pushed: true, branchName }
+      return { pushed: true, branchName, validationFailed: pushedDespiteValidationFailure }
     },
   })
 

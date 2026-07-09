@@ -84,17 +84,23 @@ Produce a draft pull request with a clear report. Never push directly to the mai
           \`affectedCustomizationIds\` so the model knows which fork invariants to preserve.
       - If confidence is "high" or "medium": verify no conflict markers remain, then call apply_resolved_file, then continue_cherry_pick.
       - If confidence is "low" or the tool returned an error: call abort_cherry_pick, mark commit as conflict-blocked.
+      - apply_resolved_file enforces the configured minimum confidence in host code: if it returns
+        blocked:true, do NOT retry with the same content — call abort_cherry_pick and mark the commit
+        conflict-blocked with the reason it returned.
 6. Call run_validation with the highest risk level encountered in this run.
-   - If classify_commit_risk returned non-empty \`testCommands\` for any commit in this run, pass them
-     as \`extraCommands\` to run_validation so customization-specific tests are included in the suite.${finalValidationStep}
+   - Pass the union of all \`customizationIds\` returned by classify_commit_risk in this run as the
+     \`customizationIds\` input — the tool looks up and runs the matching testCommands from
+     customizations.yaml itself. Do NOT copy test command strings manually.${finalValidationStep}
 7. If validation fails: note it in the report, mark relevant commits as validation-failed.
+   The failure is also recorded host-side — the report and exit code will flag it automatically.
 8. Call push_sync_branch (unless dry-run).
-9. Call find_existing_sync_pr to check for an existing PR.
-10. Call generate_report with the full summary of all decisions.
-11. Call create_sync_pr with the report as body (unless an existing PR was found and up to date).
-12. If the task context line says "Auto-merge on success: enabled" AND all commits in this run were
-    applied or skipped (none are conflict-blocked or validation-failed) AND run_validation returned
-    allPassed:true, call auto_merge_pr(prNumber) with the PR number from step 11.
+9. If the task context line says "Auto-merge on success: enabled" AND all commits in this run were
+   applied or skipped (none are conflict-blocked or validation-failed) AND run_validation returned
+   allPassed:true: call find_existing_sync_pr, then create_sync_pr if none exists, then
+   auto_merge_pr(prNumber). Host-side gates will refuse the merge if validation failed or never ran.
+10. Call generate_report with the full summary of all decisions. This is the LAST step — it ends the
+    run. When config.sync.createPullRequest is enabled the report tool creates or updates the sync PR
+    itself; you do not need to call create_sync_pr beforehand (except in the auto-merge flow of step 9).
 
 ## Accountability (enforced — never skip)
 - You received a finite list of SHAs from list_candidate_commits.

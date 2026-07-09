@@ -55,9 +55,11 @@ import { readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync } from "
 import { resolve as resolvePath, join as joinPath, relative as relativePath } from "node:path";
 import { git } from "../git/git-client.js";
 import { CHECKPOINT_FILENAME } from "../git/git-tools.js";
+import { createOrUpdateSyncPr } from "../github/github-tools.js";
 import { Agent } from "@sctg/cline-sdk";
 import { defineTool } from "../tool-helper.js";
 import type { SyncConfig } from "../config/schema.js";
+import { validationFailed, type RunState } from "../agent/run-state.js";
 
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -286,6 +288,7 @@ export function makeReportTool(
   providerId: string,
   apiKey: string | undefined,
   keypoolEventHandler?: KeypoolEventHandler,
+  runState?: RunState,
 ) {
   return defineTool({
     name: "generate_report",
@@ -338,7 +341,15 @@ export function makeReportTool(
       // --- Partition commits by final status for the summary section ---
       const applied = commitResults.filter((r) => ["applied", "conflict-resolved"].includes(r.status))
       const needsReview = commitResults.filter((r) => ["conflict-blocked", "validation-failed"].includes(r.status))
-      const allPassed = needsReview.length === 0
+
+      // --- Host-side reconciliation against the run state ---
+      // The model may under-report problems (observed in real runs: a failed
+      // validation suite reported as a clean sync).  A run with a failed
+      // validation or any host-gate activation can never be presented as clean.
+      const hostValidationFailed = runState ? validationFailed(runState) : false
+      const hostGateEvents = runState?.gateEvents ?? []
+      const allPassed = needsReview.length === 0 && !hostValidationFailed
+      const needsHumanReview = needsReview.length > 0 || hostValidationFailed || hostGateEvents.length > 0
 
       // --- Accountability check: detect silently dropped commits ---
       const processedShas = new Set([
@@ -365,8 +376,22 @@ export function makeReportTool(
         `- ⚠️ Needs human review: ${needsReview.length}`,
         `- ⛔ Blocked (not attempted): ${blockedCommits.length}`,
         ...(unaccounted.length > 0 ? [`- 🔴 Unaccounted (agent bug): ${unaccounted.length}`] : []),
+        ...(hostValidationFailed ? ["- 🔴 Validation suite FAILED during this run (host-verified)"] : []),
         "",
       ]
+
+      if (hostValidationFailed || hostGateEvents.length > 0) {
+        prBodyLines.push("### 🛑 Host-side gate report", "")
+        if (hostValidationFailed) {
+          const failedLevels = (runState?.validations ?? []).filter((v) => !v.allPassed).map((v) => v.level)
+          prBodyLines.push(
+            `- Validation suite(s) FAILED: ${failedLevels.join(", ")} — this run requires human review ` +
+              "regardless of per-commit statuses above.",
+          )
+        }
+        for (const event of hostGateEvents) prBodyLines.push(`- ${event}`)
+        prBodyLines.push("")
+      }
 
       if (applied.length > 0) {
         prBodyLines.push("### Applied commits", "")
@@ -706,7 +731,33 @@ export function makeReportTool(
         }
       }
 
-      return { report, agentState, allPassed, needsHumanReview: needsReview.length > 0 }
+      // --- Deterministic PR creation (wires config.sync.createPullRequest) ---
+      // Because generate_report completes the run, any prompt step after it never
+      // executes — so the PR must be created here, host-side, not by the model.
+      let pr: { url: string; number: number; created: boolean } | null = null
+      if (config.sync.createPullRequest && syncBranch && !config.sync.dryRun) {
+        try {
+          pr = await createOrUpdateSyncPr(config, syncBranch, report, agentState)
+          process.stderr.write(
+            `[Report] Sync PR ${pr.created ? "created" : "updated"}: ${pr.url}\n`,
+          )
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err)
+          process.stderr.write(`[Report] Warning: could not create/update sync PR: ${msg}\n`)
+        }
+      }
+
+      // Record the outcome for main.ts exit-code mapping.
+      if (runState) {
+        runState.reportOutcome = {
+          allPassed,
+          needsHumanReview,
+          blockedCount: blockedCommits.length,
+          unaccountedCount: unaccounted.length,
+        }
+      }
+
+      return { report, agentState, allPassed, needsHumanReview, pr }
     },
   })
 }

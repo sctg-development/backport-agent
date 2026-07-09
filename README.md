@@ -15,11 +15,12 @@ Backport Agent focuses on the parts that matter most:
 - classify change risk before touching the fork;
 - preserve fork-specific customizations;
 - run validation after each meaningful integration step;
-- produce a clear report instead of pushing blind changes.
+- produce a clear report — and a draft PR — instead of pushing blind changes;
+- **enforce its safety rules in host code, not just in the model prompt**, so it can run unattended (daily cron/launchd).
 
 ## What it does
 
-The agent works as a sync pipeline rather than a one-shot merge bot. It reads the upstream history, selects candidate commits, evaluates their risk, applies them in controlled batches, validates the result, and generates a report for review.
+The agent works as a sync pipeline rather than a one-shot merge bot. It reads the upstream history, selects candidate commits, evaluates their risk, applies them in controlled batches, validates the result, opens or updates a draft pull request, and generates a report for review.
 
 It is built to support forks that include features such as:
 
@@ -28,15 +29,27 @@ It is built to support forks that include features such as:
 - documentation generation pipelines;
 - a local reporting and validation workflow.
 
-## Key Features
+## Key features
 
-- **Enhanced KeypoolLive Support**: Real-time event handling and token monitoring with comprehensive statistics tracking
-- **Key Usage Reporting**: Detailed Markdown reports showing token usage by model and key
-- **Improved Error Handling**: Enhanced timeout detection and verbose error reporting
-- **Context Compaction**: Automatic conversation history compaction when approaching context limits
-- **HTTP Debugging**: Optional debug fetch wrapper for detailed request/response logging
-- **Benchmark Replay**: Compare different LLM models using existing prompt logs
-- **User-Agent Logging**: Track API requests with detailed user-agent information
+- **Host-side safety gates (v0.8.0)**: the critical rules are enforced in code, whatever the orchestrator model decides — see [Host-side gates](#host-side-gates-v080).
+- **Meaningful exit codes**: `0` clean sync, `2` sync needs human attention, `1` fatal error — designed for cron wrappers.
+- **Deterministic PR creation**: the report step itself creates/updates the draft sync PR (`sync.createPullRequest`).
+- **Customization test execution**: `tests` declared in `customizations.yaml` run as trusted commands when the affected customizations are touched.
+- **Enhanced KeypoolLive support**: real-time event handling, token monitoring, key-usage reports by model and key.
+- **Context management**: soft/hard context limits, automatic compaction with a large-context summarizer model.
+- **Benchmark replay**: compare two models on the prompt log of a past run without touching a real repository.
+- **HTTP debugging**: optional debug fetch wrapper (`BACKPORT_HTTP_DEBUG=verbose`).
+
+## Host-side gates (v0.8.0)
+
+An unattended agent cannot rely on prompt-following alone. Since v0.8.0 a shared run state (`src/agent/run-state.ts`) is threaded through the tools and enforces:
+
+| Gate | Behaviour |
+|---|---|
+| **Confidence gate** | `resolve_conflict_with_ai` records the *effective* confidence (after conflict-marker, syntax and consensus guards) of every resolution. `apply_resolved_file` **refuses to write** a resolution below `ai.minAutoApplyConfidence` and instructs the agent to abort the cherry-pick. |
+| **Validation gate** | Every `run_validation` outcome is recorded. `auto_merge_pr` **refuses to merge** when validation failed or never ran. |
+| **Report reconciliation** | `generate_report` cross-checks the model-provided summary against the recorded state: a failed validation suite can never be reported as a clean run. Gate activations appear in a dedicated *Host-side gate report* section. |
+| **Exit code** | `main.ts` maps the outcome to the process exit code: `0` clean, `2` needs human attention (blocked commits, failed validation, fired gates, context abort), `1` fatal. |
 
 ## How it is structured
 
@@ -44,20 +57,21 @@ The codebase is intentionally split into small, testable pieces:
 
 - `src/git` handles Git operations and cherry-pick workflows;
 - `src/risk` classifies commits and customization sensitivity;
-- `src/validation` runs allowlisted validation commands;
-- `src/github` manages pull request creation and metadata;
-- `src/reports` assembles the final sync report;
+- `src/validation` runs config/manifest (trusted) and LLM-suggested (allowlisted) validation commands;
+- `src/github` manages pull request creation, auto-merge and metadata;
+- `src/reports` assembles the final sync report and creates/updates the sync PR;
 - `src/ai` exposes analysis helpers used when deterministic logic is not enough;
+- `src/agent` wires the agent loop: system prompt, retry logic, context compaction, host-side run state;
 - `src/config` and `src/customizations` load the sync configuration and fork-specific invariants.
 
 The agent entry point is [src/main.ts](src/main.ts), which wires the sync flow together and also enables the built-in SDK tools used by the runtime.
 
 ## Getting started
 
-1. Install dependencies.
+1. Install dependencies (bun and npm both work).
 
 ```bash
-npm install
+bun install        # or: npm install
 ```
 
 2. Copy the example configuration files and adjust them for your environment.
@@ -77,94 +91,67 @@ KEYPOOL_LIVE_SECRET=...
 For any other provider supported by `@sctg/cline-sdk`, set the corresponding API key:
 
 ```bash
-ANTHROPIC_API_KEY=sk-ant-...
-# or OPENAI_API_KEY=sk-..., MISTRAL_API_KEY=..., etc.
+MISTRAL_API_KEY=...
+# or GEMINI_API_KEY=..., COHERE_API_KEY=..., etc.
 ```
+
+For PR creation (`sync.createPullRequest: true`), a `GITHUB_TOKEN` with `repo` scope is required (e.g. `export GITHUB_TOKEN="$(gh auth token)"`).
 
 You can also override the provider or API key at runtime without editing `config.json`:
 
 ```bash
-npm start -- --provider anthropic --api-key sk-ant-...
+bun run start -- --provider mistral --api-key ...
 ```
 
 4. Start the agent.
 
 ```bash
-npm start
+bun run start
 ```
 
 If you want a no-op run that still exercises the workflow, use:
 
 ```bash
-npm run dry-run
+bun run dry-run
 ```
 
-Set `VERBOSE=true` to see detailed iteration and tool-call progress in stderr:
+To list pending upstream commits without running the agent (cheap smoke test — no LLM calls):
 
 ```bash
-VERBOSE=true npm start
+node dist/main.mjs --list-backport-needed --config path/to/config.json
 ```
 
-For enhanced HTTP debugging, set `BACKPORT_HTTP_DEBUG=verbose`:
+Set `VERBOSE=true` to see detailed iteration and tool-call progress in stderr, and `BACKPORT_HTTP_DEBUG=verbose` for detailed request/response logging.
+
+## Daily unattended runs
+
+`scripts/` contains a ready-to-use daily automation for macOS:
+
+- [scripts/run-daily-sync.sh](scripts/run-daily-sync.sh) — wrapper with a single-instance lock, launchd-safe `PATH`, `GITHUB_TOKEN` derived from `gh auth token`, a local build of the agent, per-run logs in `~/Library/Logs/backport-agent/`, and a macOS notification when the run exits `2` (needs review) or `1` (failure).
+- [scripts/org.sctg.backport-agent.plist](scripts/org.sctg.backport-agent.plist) — LaunchAgent running the wrapper daily at 07:15.
 
 ```bash
-BACKPORT_HTTP_DEBUG=verbose npm start
+cp scripts/org.sctg.backport-agent.plist ~/Library/LaunchAgents/
+launchctl load ~/Library/LaunchAgents/org.sctg.backport-agent.plist
+launchctl start org.sctg.backport-agent   # trigger a run immediately
 ```
+
+Recommended rollout: keep `sync.autoMergeOnSuccess` disabled at first. Each daily run then pushes a sync branch and opens/updates a **draft PR** you can review in one glance; once you trust the pipeline, enabling auto-merge is safe because the merge is host-gated on validation.
 
 ## Retry behavior
 
 The agent includes automatic retry logic for transient provider errors (rate limits, overloaded endpoints, high-demand responses, HTTP 503, etc.). When a retriable error is detected, the agent waits with exponential backoff (15 s, 30 s, 45 s…) and restarts up to 5 times.
 
-Because agent state is anchored to Git, restarting is safe — already-applied commits are detected from the git log and skipped automatically.
-
-The iteration counter in verbose output is continuous across retries. A retry is indicated by a suffix in the progress lines:
-
-```
---- iteration 16 ---
-[Retry] Silent provider error on attempt 1/5: This model is currently experiencing high demand…
-[Retry] Waiting 15s before retrying...
---- iteration 17 - Retry 1 ---
---- iteration 18 - Retry 1 ---
-```
-
-## Key Usage Reporting
-
-When using the `keypoollive` provider, the agent generates detailed key usage reports showing:
-
-- Tokens by Model ID (input/output/total)
-- Tokens by Key and Model ID
-- Total usage statistics and key rotation events
-
-This provides better visibility into API key usage patterns across different models.
-
-## Context Management
-
-The agent includes sophisticated context management features:
-
-- **Soft Context Limits**: Injects wrap-up signals when approaching token limits
-- **Hard Context Limits**: Aborts runs before context window overflow
-- **Automatic Compaction**: Uses large-context summarizer models to compact conversation history
-- **Context Budget Tracking**: Monitors token usage and provides warnings
-
-## Debugging and Monitoring
-
-Enhanced debugging capabilities are available:
-
-- **HTTP Debug Mode**: Set `BACKPORT_HTTP_DEBUG=verbose` for detailed request/response logging
-- **Timeout Detection**: Automatic detection and enhanced logging for timeout errors
-- **Keypool Event Tracking**: Real-time visibility into key selection, rotation, and exhaustion events
-- **Verbose Stack Traces**: Detailed error information in verbose mode
+Because agent state is anchored to Git (plus a within-run checkpoint file), restarting is safe — already-applied commits are detected and skipped automatically.
 
 ## Validation and tests
 
 The repository includes both unit and integration coverage.
 
-- `npm run typecheck` checks the TypeScript build.
-- `npm test` runs the full test suite.
-- `npm run test:unit` runs fast deterministic tests.
-- `npm run test:integration` runs integration tests, including real KeypoolLive calls when your vault is configured.
-
-The integration suite is intentionally practical. It verifies Git behavior in temporary repositories and exercises real SDK tools against a configured provider (defaults to `keypoollive` with the `mistral/devstral-latest` model) when `.env` is available.
+- `bun run typecheck` checks the TypeScript build.
+- `bun run test` runs the full test suite.
+- `bun run test:unit` runs fast deterministic tests (includes the host-gate and schema-alias tests).
+- `bun run test:integration` runs integration tests, including real KeypoolLive calls when your vault is configured.
 
 ## Configuration
 
@@ -175,10 +162,29 @@ The main runtime configuration lives in a JSON file modeled after [config.exampl
 - the working directory;
 - the LLM provider and model selection (`provider`, `fast`, `specialist`, `powerful`, `summarizer`);
 - sync limits and batching;
-- validation tiers;
+- validation tiers (`low` / `medium` / `high` / `final`);
+- AI quality guardrails;
 - context management parameters.
 
-The `provider` field in the `models` section is required. It accepts any provider ID supported by `@sctg/cline-sdk` (e.g. `"keypoollive"`, `"anthropic"`, `"openai"`, `"mistral"`, `"gemini"`). The API key is resolved from the `apiKey` field, a `$ENV_VAR` reference, or the implicit `{PROVIDER_UPPER}_API_KEY` environment variable.
+The `provider` field in the `models` section is required. It accepts any provider ID supported by `@sctg/cline-sdk` (e.g. `"keypoollive"`, `"mistral"`, `"gemini"`, `"cohere"`, `"openai"`, `"anthropic"`). The API key is resolved from the `apiKey` field, a `$ENV_VAR` reference, or the implicit `{PROVIDER_UPPER}_API_KEY` environment variable.
+
+### Model roles
+
+| Role | Used for | Guidance |
+|---|---|---|
+| `fast` | The orchestrator agent loop, small-diff analysis, report diagram | A reliable tool-calling model with a comfortable context window (the whole run lives in its context). |
+| `specialist` | First attempt of every conflict resolution | **The most capable code model you have.** JSON-output reliability matters: a specialist that returns malformed JSON silently degrades resolutions. E.g. `mistral/mistral-medium-3-5`. |
+| `powerful` | Conflict-resolution fallback, large-diff analysis, consensus second opinion | Ideally a **different vendor** than `specialist` so the consensus check is a real second opinion, with a large context window. E.g. `gemini/gemini-3.1-pro-preview`. |
+| `summarizer` | Context compaction | A cheap large-context model. E.g. `gemini/gemini-3-flash-preview`. |
+
+### `sync` section highlights
+
+| Field | Default | Description |
+|---|---|---|
+| `maxCommitsPerRun` | `5` | Upper bound of commits processed per run. Size it against the `fast` model's context window (10 commits ≈ 170k+ tokens observed on a 262k model). |
+| `createPullRequest` | `true` | When enabled, `generate_report` deterministically creates (or updates) the draft sync PR host-side. Requires `GITHUB_TOKEN`. |
+| `autoMergeOnSuccess` | `false` | Allows `auto_merge_pr`, which is additionally host-gated on validation success. |
+| `skipCommits` | `[]` | SHAs or subject patterns to always skip (release noise, docs churn…). |
 
 ### `sync.prNumberMatching` — Manual backport detection (optional)
 
@@ -200,13 +206,9 @@ When a commit is cherry-picked manually (conflict resolution, subject rewrite, n
 | `enabled` | `false` | Activate PR-number-based duplicate detection. |
 | `minSubjectSimilarity` | `0.4` | Minimum Jaccard word-token similarity (0–1) between the upstream subject and the matching fork subject. Lower → more permissive (risk of false positives). Higher → stricter (may miss heavily reworded backports). |
 
-**Example:** upstream commit `Move \`sdk/apps/\` to \`apps/\` (#11200)` is detected as already applied when the fork contains `feat(backport): Move sdk/apps/ to apps/ (cline#11200)` — the PR number matches and the similarity score (~0.67) exceeds the default threshold.
-
 Enable this only when your team consistently includes the upstream PR number in manual backport commit messages.
 
-### `ai` section — Quality guardrails (optional)
-
-The optional `ai` section configures the AI quality guardrails introduced to improve backport reliability. All fields have safe defaults and the section can be omitted entirely.
+### `ai` section — Quality guardrails
 
 ```json
 "ai": {
@@ -220,127 +222,64 @@ The optional `ai` section configures the AI quality guardrails introduced to imp
 
 | Field | Default | Description |
 |---|---|---|
-| `minAutoApplyConfidence` | `"medium"` | Minimum AI confidence level (`"high"` or `"medium"`) to auto-apply a conflict resolution. Use `"high"` for stricter auto-apply. |
-| `requireReviewOnSemanticRisk` | `false` | When `true`, any commit carrying semantic risk factors is escalated to `"review-required"` by `reconcile_ai_assessments`, regardless of the individual AI recommendations. |
-| `enableConflictConsensus` | `false` | **Opt-in.** Runs a second, independent conflict resolution using `config.models.powerful` and compares both outputs with a Dice-coefficient similarity score. If the two resolutions diverge below `conflictConsensusThreshold`, confidence is downgraded to `"low"`. Enabling this roughly doubles LLM cost per conflict. |
-| `conflictConsensusThreshold` | `0.7` | Minimum line-level similarity (0–1) required for consensus. Only used when `enableConflictConsensus: true`. |
-| `enrichCustomizationContext` | `true` | When `true`, `check_customization_compatibility` reads up to 2 source files matching each customization glob (2 000 chars each) and injects their content into the AI prompt for richer analysis. |
+| `minAutoApplyConfidence` | `"medium"` | Minimum effective AI confidence to auto-apply a conflict resolution. **Enforced host-side since v0.8.0**: `apply_resolved_file` refuses resolutions below this threshold. Use `"high"` for stricter auto-apply. |
+| `requireReviewOnSemanticRisk` | `false` | When `true`, any commit carrying semantic risk factors is escalated to `"review-required"` by `reconcile_ai_assessments`. |
+| `enableConflictConsensus` | `false` | **Opt-in, recommended for unattended runs.** Runs a second, independent conflict resolution using `config.models.powerful` and compares both outputs with a Dice-coefficient similarity score. Divergence below `conflictConsensusThreshold` downgrades confidence to `"low"` — which the host confidence gate then blocks. Roughly doubles LLM cost per conflict. |
+| `conflictConsensusThreshold` | `0.7` | Minimum line-level similarity (0–1) required for consensus. |
+| `enrichCustomizationContext` | `true` | When `true`, `check_customization_compatibility` reads up to 2 source files matching each customization glob (2 000 chars each) and injects their content into the AI prompt. |
 
-### `models.summarizer` — Context compaction (optional)
+## Customizations manifest
 
-For long-running sync operations, you can configure a separate large-context model for conversation compaction:
+Fork invariants live in a YAML file modeled after [customizations.example.yaml](customizations.example.yaml). Each entry describes one deliberate deviation from upstream:
 
-```json
-"models": {
-  "summarizer": {
-    "provider": "anthropic",
-    "modelId": "claude-3-5-sonnet-20240620",
-    "apiKey": "$ANTHROPIC_API_KEY"
-  }
-}
+```yaml
+customizations:
+  - id: keypoollive-provider
+    description: Vault-backed key-rotation LLM provider
+    paths:                    # globs OWNED by the customization → high risk
+      - "sdk/packages/llms/src/providers/vendors/keypoollive.ts"
+    related_files:            # shared wiring/registration points → at least medium risk
+      - "apps/vscode/src/shared/api.ts"
+    invariants:               # prose rules injected into AI conflict-resolution prompts
+      - "The 'keypoollive' id must stay in the ApiProvider union."
+    tests:                    # trusted shell commands run by run_validation
+      - "bun run test:invariants"
 ```
 
-When the conversation history approaches the context limit, the agent automatically uses this model to summarize the progress and continue processing remaining commits.
+Field semantics (since v0.8.0):
 
-### AI sub-agent tools
+- `paths` — any upstream commit touching these globs is classified **high** risk and triggers the mandatory AI compatibility checks.
+- `related_files` (alias `relatedFiles`) — files that interact with the customization without being owned by it; changes there raise risk to at least **medium** and pull in the entry's tests.
+- `invariants` — human-readable rules; they are injected into the conflict-resolution prompt when the file overlaps the customization.
+- `tests` (alias `testCommands`) — shell commands verifying the customization still works. The agent passes *customization IDs* (never command strings) to `run_validation`, which looks the commands up in the manifest and runs them via bash as **trusted** commands — they are user-authored configuration, exactly like `config.validation.*`.
+
+A practical pattern: centralize all deterministic checks in one script in your fork (e.g. `check-fork-invariants.sh` exposed as `bun run test:invariants`), reference it from every entry's `tests`, and add it to every `config.validation` tier. Cheap (<1 s), and it runs even for low-risk commits.
+
+## AI sub-agent tools
 
 The `src/ai` module exposes four tools that the main agent invokes when deterministic logic is not enough.
 
 | Tool | Type | Purpose |
 |---|---|---|
-| `resolve_conflict_with_ai` | LLM call | Resolves merge conflicts in a single file using the configured `specialist` model. Returns `resolvedContent`, `confidence` (`"high"` / `"medium"` / `"low"`), and `reasoning`. Guards: conflict-marker detection, syntax balance check (JS/TS), optional dual-model consensus. |
+| `resolve_conflict_with_ai` | LLM call | Resolves merge conflicts in a single file using the `specialist` model (fallback: `powerful`). Returns `resolvedContent`, `confidence` (`"high"` / `"medium"` / `"low"`), and `reasoning`. Guards: conflict-marker detection, syntax balance check (JS/TS), optional dual-model consensus. The effective confidence is recorded host-side for the apply gate. |
 | `analyze_commit_for_backport` | LLM call | Analyzes a commit diff to produce a summary, key changes, complexity estimate, semantic risk factors, and a backport `recommendation`. Also runs hallucination detection on referenced file paths. |
-| `check_customization_compatibility` | LLM call | Checks whether a set of changes is compatible with the fork's declared customizations. Optionally enriches the prompt with actual file content when `ai.enrichCustomizationContext` is enabled. |
-| `reconcile_ai_assessments` | Deterministic | **No LLM call.** Combines the outputs of the two analysis tools into a single `finalRecommendation`. Detects contradictions (e.g. analyze said "apply" but compatibility check failed), applies `requireReviewOnSemanticRisk` escalation, and always resolves ambiguity conservatively. Call this after both analysis tools have run for the same commit. |
+| `check_customization_compatibility` | LLM call | Checks whether a set of changes is compatible with the fork's declared customizations. Optionally enriches the prompt with actual file content (`ai.enrichCustomizationContext`). |
+| `reconcile_ai_assessments` | Deterministic | **No LLM call.** Combines the outputs of the two analysis tools into a single `finalRecommendation`, detects contradictions, applies `requireReviewOnSemanticRisk`, resolves ambiguity conservatively. |
 
 Every LLM call is logged to the run's `.prompts.jsonl` file alongside structured quality signals (guards triggered, confidence, hallucination suspects). The detailed report includes a **Decision Quality Metrics** section summarising these signals across the full run.
 
-#### Benchmark replay
+### Benchmark replay
 
 The `src/tools/benchmark-replay.ts` script lets you compare two models side-by-side without running a full sync against a real repository. It reads an existing `.prompts.jsonl` log, replays every LLM call with the alternative model, and prints a Markdown comparison report.
 
 ```bash
-npx tsx src/tools/benchmark-replay.ts \
+bunx tsx src/tools/benchmark-replay.ts \
   --log run-1780060224987.prompts.jsonl \
-  --model anthropic/claude-sonnet-4-5 \
-  --provider anthropic \
-  --api-key "$ANTHROPIC_API_KEY" > comparison.md
+  --model mistral/mistral-medium-3-5 \
+  --provider keypoollive > comparison.md
 ```
 
-### `sync.prNumberMatching` — Manual backport detection (optional)
-
-By default, the agent detects already-applied commits using three signals: `git cherry` patch comparison, exact subject-line match, and the `cherry picked from commit <sha>` annotation added by `git cherry-pick -x`.
-
-When a commit is cherry-picked manually (conflict resolution, subject rewrite, no `-x` flag), all three signals can miss it. Enabling `prNumberMatching` adds a fourth signal: if a fork commit references the same upstream PR number **and** the two subjects are similar enough (Jaccard word-token score), the commit is considered already applied.
-
-```json
-"sync": {
-  "prNumberMatching": {
-    "enabled": true,
-    "minSubjectSimilarity": 0.4
-  }
-}
-```
-
-| Field | Default | Description |
-|---|---|---|
-| `enabled` | `false` | Activate PR-number-based duplicate detection. |
-| `minSubjectSimilarity` | `0.4` | Minimum Jaccard word-token similarity (0–1) between the upstream subject and the matching fork subject. Lower → more permissive (risk of false positives). Higher → stricter (may miss heavily reworded backports). |
-
-**Example:** upstream commit `Move \`sdk/apps/\` to \`apps/\` (#11200)` is detected as already applied when the fork contains `feat(backport): Move sdk/apps/ to apps/ (cline#11200)` — the PR number matches and the similarity score (~0.67) exceeds the default threshold.
-
-Enable this only when your team consistently includes the upstream PR number in manual backport commit messages.
-
-### `ai` section — Quality guardrails (optional)
-
-The optional `ai` section configures the AI quality guardrails introduced to improve backport reliability. All fields have safe defaults and the section can be omitted entirely.
-
-```json
-"ai": {
-  "minAutoApplyConfidence": "medium",
-  "requireReviewOnSemanticRisk": false,
-  "enableConflictConsensus": false,
-  "conflictConsensusThreshold": 0.7,
-  "enrichCustomizationContext": true
-}
-```
-
-| Field | Default | Description |
-|---|---|---|
-| `minAutoApplyConfidence` | `"medium"` | Minimum AI confidence level (`"high"` or `"medium"`) to auto-apply a conflict resolution. Use `"high"` for stricter auto-apply. |
-| `requireReviewOnSemanticRisk` | `false` | When `true`, any commit carrying semantic risk factors is escalated to `"review-required"` by `reconcile_ai_assessments`, regardless of the individual AI recommendations. |
-| `enableConflictConsensus` | `false` | **Opt-in.** Runs a second, independent conflict resolution using `config.models.powerful` and compares both outputs with a Dice-coefficient similarity score. If the two resolutions diverge below `conflictConsensusThreshold`, confidence is downgraded to `"low"`. Enabling this roughly doubles LLM cost per conflict. |
-| `conflictConsensusThreshold` | `0.7` | Minimum line-level similarity (0–1) required for consensus. Only used when `enableConflictConsensus: true`. |
-| `enrichCustomizationContext` | `true` | When `true`, `check_customization_compatibility` reads up to 2 source files matching each customization glob (2 000 chars each) and injects their content into the AI prompt for richer analysis. |
-
-### AI sub-agent tools
-
-The `src/ai` module exposes four tools that the main agent invokes when deterministic logic is not enough.
-
-| Tool | Type | Purpose |
-|---|---|---|
-| `resolve_conflict_with_ai` | LLM call | Resolves merge conflicts in a single file using the configured `specialist` model. Returns `resolvedContent`, `confidence` (`"high"` / `"medium"` / `"low"`), and `reasoning`. Guards: conflict-marker detection, syntax balance check (JS/TS), optional dual-model consensus. |
-| `analyze_commit_for_backport` | LLM call | Analyzes a commit diff to produce a summary, key changes, complexity estimate, semantic risk factors, and a backport `recommendation`. Also runs hallucination detection on referenced file paths. |
-| `check_customization_compatibility` | LLM call | Checks whether a set of changes is compatible with the fork's declared customizations. Optionally enriches the prompt with actual file content when `ai.enrichCustomizationContext` is enabled. |
-| `reconcile_ai_assessments` | Deterministic | **No LLM call.** Combines the outputs of the two analysis tools into a single `finalRecommendation`. Detects contradictions (e.g. analyze said "apply" but compatibility check failed), applies `requireReviewOnSemanticRisk` escalation, and always resolves ambiguity conservatively. Call this after both analysis tools have run for the same commit. |
-
-Every LLM call is logged to the run's `.prompts.jsonl` file alongside structured quality signals (guards triggered, confidence, hallucination suspects). The detailed report includes a **Decision Quality Metrics** section summarising these signals across the full run.
-
-#### Benchmark replay
-
-The `src/tools/benchmark-replay.ts` script lets you compare two models side-by-side without running a full sync against a real repository. It reads an existing `.prompts.jsonl` log, replays every LLM call with the alternative model, and prints a Markdown comparison report.
-
-```bash
-npx tsx src/tools/benchmark-replay.ts \
-  --log run-1780060224987.prompts.jsonl \
-  --model anthropic/claude-sonnet-4-5 \
-  --provider anthropic \
-  --api-key "$ANTHROPIC_API_KEY" > comparison.md
-```
-
-Custom fork invariants live in a YAML file modeled after [customizations.example.yaml](customizations.example.yaml). This is where you describe the areas that must not be broken by a backport run.
-
-
+Use this before switching the `specialist` model: replay the conflicts of a past run and compare JSON validity, confidence distribution and resolution quality.
 
 ## For contributors
 
@@ -358,39 +297,38 @@ Contributions are especially welcome in the following areas:
 
 If you are looking for a good first contribution, start with tests or documentation. The project already has a deterministic core, so incremental improvements are easy to verify.
 
-## Recent Improvements
+## Recent improvements
 
-### Version 0.6.1 (Current)
+### Version 0.8.0 (current)
 
-- **Key Usage Reporting**: Added `generateKeyUsageReport()` function for detailed token usage analysis
-- **Enhanced KeypoolLive Support**: Comprehensive event handlers for key selection, rotation, and exhaustion
-- **Improved Error Handling**: Better timeout detection and verbose error reporting
-- **Context Management**: Automatic conversation compaction and context budget tracking
-- **HTTP Debugging**: Optional debug fetch wrapper for detailed API request/response logging (`BACKPORT_HTTP_DEBUG=verbose`)
-- **Configuration Updates**: Added support for summarizer models and enhanced context management
+- **Host-side safety gates**: `ai.minAutoApplyConfidence` is now enforced in code by `apply_resolved_file`; `auto_merge_pr` is blocked when validation failed or never ran; `generate_report` reconciles the model's summary with the recorded run state.
+- **Meaningful exit codes**: `0` clean / `2` needs human attention / `1` fatal — cron-friendly.
+- **Customization tests actually run**: `tests`/`related_files` YAML keys are accepted (aliases of `testCommands`/`relatedFiles`) instead of being silently dropped by schema validation; `run_validation` resolves them by customization ID from the trusted manifest and runs them via bash.
+- **`related_files` risk classification**: changes to registration/wiring files raise risk to at least medium and pull in the entry's tests.
+- **Deterministic PR creation**: `sync.createPullRequest` is wired — the report step creates/updates the draft sync PR host-side (the old prompt-driven PR step never ran because `generate_report` terminates the run).
+- **Daily automation**: `scripts/run-daily-sync.sh` + `scripts/org.sctg.backport-agent.plist` (macOS launchd).
+
+### Version 0.6.1
+
+- Key usage reporting, enhanced KeypoolLive event handling, improved timeout handling, context compaction, HTTP debugging, summarizer model support.
 
 ### Version 0.4.0
 
-- **User-Agent Logging**: Improved retry iteration tracking and user-agent logging
-- **Content Truncation**: Added `maxBytes` parameter to `getFileAtRef` for content truncation
-- **File Reference Detection**: Improved file reference detection with customization support
-- **Dependency Updates**: Upgraded all dependencies to latest versions
+- User-agent logging, content truncation (`maxBytes`), improved file reference detection, dependency updates.
 
 ### Version 0.2.0
 
-- **KeypoolLive Integration**: Full support for vault-based key rotation with real-time monitoring
-- **Enhanced Logging**: Verbose logging and run summary reporting
-- **AWS SDK Updates**: Updated all AWS SDK dependencies to latest versions
+- KeypoolLive integration (vault-based key rotation), verbose logging and run summaries.
 
 ## Design principles
 
-This project intentionally avoids the “merge everything and hope” approach. The main design goals are:
+This project intentionally avoids the "merge everything and hope" approach. The main design goals are:
 
-- preserve the fork’s intent;
+- preserve the fork's intent;
 - keep changes small and reviewable;
 - use deterministic logic first;
 - use AI only where it adds clear value;
-- fail safely when confidence is low.
+- fail safely when confidence is low — **and enforce that failure mode in code**.
 
 That makes the agent more useful for real maintenance work and easier for contributors to reason about.
 

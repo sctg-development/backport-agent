@@ -51,46 +51,68 @@ import { z } from "zod"
  *     - "npm run typecheck"
  * ```
  */
-export const CustomizationEntrySchema = z.object({
-  /**
-   * Short machine-readable identifier for this customization, e.g. `"keypoollive-provider-vscode"`.
-   * Used in risk reports and decision logs to unambiguously reference the entry.
-   */
-  id: z.string(),
+export const CustomizationEntrySchema = z
+  .object({
+    /**
+     * Short machine-readable identifier for this customization, e.g. `"keypoollive-provider-vscode"`.
+     * Used in risk reports and decision logs to unambiguously reference the entry.
+     */
+    id: z.string(),
 
-  /**
-   * Human-readable description of what this customization does and why it exists.
-   * Surfaced in PR comments and agent decision logs.
-   */
-  description: z.string(),
+    /**
+     * Human-readable description of what this customization does and why it exists.
+     * Surfaced in PR comments and agent decision logs.
+     */
+    description: z.string(),
 
-  /**
-   * Glob patterns (relative to the repository root) that cover the files owned
-   * by this customization.  Any upstream commit touching one of these paths will
-   * be classified as high risk.
-   *
-   * Standard minimatch syntax is supported, e.g. `"src/api/providers/keypoollive/**"`.
-   */
-  paths: z.array(z.string()).describe("Glob patterns relative to repo root"),
+    /**
+     * Glob patterns (relative to the repository root) that cover the files owned
+     * by this customization.  Any upstream commit touching one of these paths will
+     * be classified as high risk.
+     *
+     * Standard minimatch syntax is supported, e.g. `"src/api/providers/keypoollive/**"`.
+     */
+    paths: z.array(z.string()).describe("Glob patterns relative to repo root"),
 
-  /**
-   * Ordered list of invariants that must remain true after every sync.
-   * The agent checks these conceptually during conflict resolution and includes
-   * them in the PR body so human reviewers know what to verify.
-   *
-   * Example: `"The SCTG_KEY_VAULT_URL constant must not be removed."`
-   */
-  invariants: z.array(z.string()).describe("Human-readable invariants that must remain true after sync"),
+    /**
+     * Ordered list of invariants that must remain true after every sync.
+     * The agent checks these conceptually during conflict resolution and includes
+     * them in the PR body so human reviewers know what to verify.
+     *
+     * Example: `"The SCTG_KEY_VAULT_URL constant must not be removed."`
+     */
+    invariants: z.array(z.string()).describe("Human-readable invariants that must remain true after sync"),
 
-  /**
-   * Optional shell commands to run in order to verify this specific customization
-   * is still intact after a sync.  These are appended to the validation suite when
-   * the commit risk level is "high" and this customization is affected.
-   *
-   * Commands must still match the global allowlist in `validation/commands.ts`.
-   */
-  testCommands: z.array(z.string()).optional().describe("Commands to verify this customization still works"),
-})
+    /**
+     * Optional shell commands to run in order to verify this specific customization
+     * is still intact after a sync.  These run through `runTrustedSuite` (they are
+     * user-authored config, same trust level as `config.validation.*`) when the
+     * agent passes the matching customization IDs to `run_validation`.
+     *
+     * `tests` is accepted as an alias — both keys feed the same field.
+     */
+    testCommands: z.array(z.string()).optional().describe("Commands to verify this customization still works"),
+
+    /** Alias for `testCommands` (the field name used by several real-world manifests). */
+    tests: z.array(z.string()).optional().describe("Alias for testCommands"),
+
+    /**
+     * Files that interact with this customization without being owned by it
+     * (registration points, conversion tables, UI wiring…).  Upstream changes to
+     * these paths are classified as at least medium risk and the list is surfaced
+     * to the AI tools as context.  `related_files` is accepted as an alias.
+     */
+    relatedFiles: z.array(z.string()).optional().describe("Related file globs (registration points, wiring)"),
+
+    /** Alias for `relatedFiles` (snake_case form used by YAML manifests). */
+    related_files: z.array(z.string()).optional().describe("Alias for relatedFiles"),
+  })
+  .transform(({ tests, related_files, testCommands, relatedFiles, ...rest }) => ({
+    ...rest,
+    // Canonicalize aliases: explicit camelCase key wins, alias fills the gap.
+    testCommands: testCommands ?? tests,
+    relatedFiles: relatedFiles ?? related_files,
+  }))
 
 /**
  * Schema for the entire customizations manifest file.

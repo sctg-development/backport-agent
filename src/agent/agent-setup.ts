@@ -40,6 +40,7 @@ import type { SyncConfig } from "../config/schema.js"
 import { buildSystemPrompt } from "./system-prompt.js"
 import { resolveApiKey } from "../config/provider.js"
 import { compactConversation, getSummarizerConfig } from "./context-compaction.js"
+import { createRunState, type RunState } from "./run-state.js"
 import { Tiktoken } from "tiktoken/lite"
 // Charger le JSON de manière synchrone compatible avec Bun
 import { createRequire } from 'node:module'
@@ -74,6 +75,8 @@ interface AgentSetupResult {
   /** Factory that creates a fresh Agent for each retry attempt. */
   agentFactory: () => Agent
   userInstructionService: Awaited<ReturnType<typeof createUserInstructionConfigService>>
+  /** Host-side run state — inspected by main.ts for exit-code mapping. */
+  runState: RunState
   keypoolStats: {
     totalInputTokens: number
     totalOutputTokens: number
@@ -228,18 +231,23 @@ export async function setupAgent(params: AgentSetupParams): Promise<AgentSetupRe
 
   await userInstructionService.start()
 
+  // --- Host-side run state ---
+  // Shared mutable state threaded into every tool factory that participates in
+  // a host-side gate (confidence, validation, auto-merge, report reconciliation).
+  const runState = createRunState()
+
   // --- Tool assembly ---
   // Each factory returns one or more AgentTool instances bound to the config.
-  const gitTools = makeGitTools(config)                 // 10 tools for git operations
+  const gitTools = makeGitTools(config, runState)       // 10 tools for git operations
   const riskTool = makeRiskTool(config, customizations) // 1 tool for risk classification
-  const validationTool = makeValidationTool(config)     // 1 tool for validation suite
-  const githubTools = makeGitHubTools(config)           // 3 tools for GitHub PR management
+  const validationTool = makeValidationTool(config, customizations, runState) // 1 tool for validation suite
+  const githubTools = makeGitHubTools(config, runState) // 4 tools for GitHub PR management
   // Pass handleKeypoolEvent so sub-agents (ai-tools, report-tools) have their
   // token usage tracked in keypoolStats — otherwise only the main agent's calls
   // appear in the detailed key usage report.
   const keypoolHandler = config.models.provider === "keypoollive" ? handleKeypoolEvent : undefined
-  const reportTool = makeReportTool(config, promptLogPath, config.models.provider, resolveApiKey(config), keypoolHandler) // 1 terminal tool (completesRun: true)
-  const aiTools = makeAiTools(config, promptLogPath, config.models.provider, resolveApiKey(config), customizations, keypoolHandler) // 4 AI-powered analysis tools
+  const reportTool = makeReportTool(config, promptLogPath, config.models.provider, resolveApiKey(config), keypoolHandler, runState) // 1 terminal tool (completesRun: true)
+  const aiTools = makeAiTools(config, promptLogPath, config.models.provider, resolveApiKey(config), customizations, keypoolHandler, runState) // 4 AI-powered analysis tools
 
   // --- SDK built-in tools ---
   const builtinTools = createBuiltinTools({
@@ -473,6 +481,7 @@ export async function setupAgent(params: AgentSetupParams): Promise<AgentSetupRe
   return {
     agentFactory,
     userInstructionService,
+    runState,
     keypoolStats
   }
 }

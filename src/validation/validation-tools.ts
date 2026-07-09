@@ -41,7 +41,9 @@ import { z } from "zod"
 import { defineTool } from "../tool-helper.js"
 import { runTrustedSuite, runValidationSuite } from "./commands.js"
 import type { SyncConfig } from "../config/schema.js"
+import type { Customizations } from "../customizations/schema.js"
 import type { RiskLevel } from "../risk/classify-risk.js"
+import type { RunState } from "../agent/run-state.js"
 
 /**
  * Builds and returns the `run_validation` agent tool.
@@ -49,33 +51,49 @@ import type { RiskLevel } from "../risk/classify-risk.js"
  * The tool is pre-bound to `config` so that the caller only needs to supply the
  * risk level and any optional extra commands at invocation time.
  *
- * @param config - Validated `SyncConfig` (provides `workingDir` and `validation` suites).
+ * @param config         - Validated `SyncConfig` (provides `workingDir` and `validation` suites).
+ * @param customizations - Loaded customizations manifest; `customizationIds` inputs are
+ *                         resolved against it so per-customization `testCommands` run
+ *                         from the trusted manifest text, not from LLM-relayed strings.
+ * @param runState       - Host-side run state; every invocation records its outcome so
+ *                         downstream gates (push, auto-merge, report, exit code) can react.
  * @returns A single agent tool: `run_validation`.
  */
-export function makeValidationTool(config: SyncConfig) {
+export function makeValidationTool(config: SyncConfig, customizations?: Customizations, runState?: RunState) {
   return defineTool({
     name: "run_validation",
     description:
       "Run the validation suite appropriate for a given risk level. " +
       "'low' runs only typecheck. 'medium' adds unit tests. 'high' adds build and integration tests. " +
       "'final' runs the comprehensive end-to-end build suite from config.validation.final (call this once after all commits are processed). " +
-      "Config-defined commands run via bash; LLM-supplied extraCommands are subject to the prefix allowlist. " +
+      "Pass customizationIds (from classify_commit_risk) so the matching testCommands from customizations.yaml are executed. " +
+      "Config- and manifest-defined commands run via bash; LLM-supplied extraCommands are subject to the prefix allowlist. " +
       "Returns success status and per-command output.",
     inputSchema: z.object({
       /** Risk level computed by `classify_commit_risk`, or "final" for the end-to-end build suite. */
       riskLevel: z.enum(["low", "medium", "high", "final"]).describe("Risk level determines which suite to run; use 'final' for the comprehensive end-to-end build check"),
       /**
+       * IDs of customization entries affected by the commits in this run, as
+       * returned by `classify_commit_risk.customizationIds`.  The tool looks up
+       * each entry's `testCommands` directly in the loaded manifest — the model
+       * only relays IDs, never command strings, so these commands stay trusted
+       * and run via bash like the config suites.
+       */
+      customizationIds: z
+        .array(z.string())
+        .optional()
+        .describe("Customization IDs whose testCommands should run (from classify_commit_risk)"),
+      /**
        * Optional additional commands to append to the standard suite.
-       * Useful for customization-specific verification commands listed in
-       * `customizations.yaml` under `testCommands`.
-       * Each command must still match the `ALLOWED_COMMAND_PREFIXES` allowlist.
+       * Each command must still match the `ALLOWED_COMMAND_PREFIXES` allowlist
+       * because these strings come from the LLM.
        */
       extraCommands: z
         .array(z.string())
         .optional()
         .describe("Additional commands to append, must match the allowed prefix list"),
     }),
-    execute: async ({ riskLevel, extraCommands = [] }) => {
+    execute: async ({ riskLevel, customizationIds = [], extraCommands = [] }) => {
       // Dry-run: skip all command execution and report success.
       if (config.sync.dryRun) {
         process.stderr.write(`[Validation] Skipped (dry-run mode): ${riskLevel} suite\n`)
@@ -91,15 +109,35 @@ export function makeValidationTool(config: SyncConfig) {
         final: config.validation.final ?? [],
       }
 
-      const configCommands = suites[riskLevel]
+      // Resolve customization testCommands from the manifest (trusted source).
+      // Unknown IDs are reported rather than silently ignored.
+      const unknownIds: string[] = []
+      const manifestCommands: string[] = []
+      for (const id of customizationIds) {
+        const entry = customizations?.customizations.find((c) => c.id === id)
+        if (!entry) {
+          unknownIds.push(id)
+          continue
+        }
+        for (const cmd of entry.testCommands ?? []) {
+          if (!manifestCommands.includes(cmd)) manifestCommands.push(cmd)
+        }
+      }
+      if (unknownIds.length > 0) {
+        process.stderr.write(`[Validation] Warning: unknown customization id(s): ${unknownIds.join(", ")}\n`)
+      }
+
+      const configCommands = [...suites[riskLevel], ...manifestCommands]
       const totalExtra = extraCommands.length
 
       process.stderr.write(
         `\n[Validation] ═══ Starting "${riskLevel}" suite` +
-        ` (${configCommands.length} command(s)${totalExtra > 0 ? ` + ${totalExtra} extra` : ""}) ═══\n`,
+        ` (${suites[riskLevel].length} command(s)` +
+        `${manifestCommands.length > 0 ? ` + ${manifestCommands.length} customization test(s)` : ""}` +
+        `${totalExtra > 0 ? ` + ${totalExtra} extra` : ""}) ═══\n`,
       )
 
-      // Config-defined commands run via bash (supports pushd/popd, &&, etc.).
+      // Config- and manifest-defined commands run via bash (supports pushd/popd, &&, etc.).
       const configResults = runTrustedSuite(configCommands, config.workingDir)
       const configPassed = configResults.every((r) => r.success)
 
@@ -113,11 +151,14 @@ export function makeValidationTool(config: SyncConfig) {
       const allResults = [...configResults, ...extraResults]
       const allPassed = allResults.every((r) => r.success)
 
+      // Record the outcome for host-side gates (push warning, auto-merge, report, exit code).
+      runState?.validations.push({ level: riskLevel, allPassed })
+
       process.stderr.write(
         `[Validation] ═══ "${riskLevel}" suite ${allPassed ? "PASSED ✓" : "FAILED ✗"} ═══\n\n`,
       )
 
-      return { riskLevel, results: allResults, allPassed }
+      return { riskLevel, results: allResults, allPassed, unknownCustomizationIds: unknownIds }
     },
     // 10-minute overall timeout: generous enough for full build suites (VSIX packaging, etc.).
     timeoutMs: 600_000,

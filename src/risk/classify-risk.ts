@@ -171,6 +171,27 @@ export function classifyRisk(sha: string, changedFiles: string[], customizations
     }
   }
 
+  // --- Step 1b: Check customization related files ---
+  // Related files (registration points, conversion tables, UI wiring…) are not
+  // owned by the customization but interact with it: an upstream change there can
+  // silently break the customization without touching its own paths.  Elevate to
+  // at least medium and collect the entry's id + testCommands so its verification
+  // suite runs for this commit.
+  for (const entry of customizations.customizations) {
+    if (matchedCustomizationIds.includes(entry.id)) continue
+    const relHits = changedFiles.filter((f) =>
+      (entry.relatedFiles ?? []).some((p) => minimatch(f.replace(/^(?:DELETE:|RENAME:)/, ""), p)),
+    )
+    if (relHits.length > 0) {
+      matchedCustomizationIds.push(entry.id)
+      reasons.push(`Touches files related to customization "${entry.id}": ${relHits.join(", ")}`)
+      if (level === "low") level = "medium"
+      if (entry.testCommands) {
+        matchedTestCommands.push(...entry.testCommands)
+      }
+    }
+  }
+
   // --- Step 2: Check high-risk file patterns ---
   // Build infrastructure changes (lockfiles, CI, tsconfig, proto) are always high risk
   // regardless of whether they touch a named customization zone.

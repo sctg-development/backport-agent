@@ -279,7 +279,7 @@ async function main() {
 
   // --- Agent setup ---
   const verbose = process.env.VERBOSE === "true"
-  const { agentFactory, userInstructionService, keypoolStats } = await setupAgent({
+  const { agentFactory, userInstructionService, runState, keypoolStats } = await setupAgent({
     config,
     promptLogPath,
     verbose
@@ -343,6 +343,26 @@ async function main() {
     })
 
     console.error(`\n=== Run complete ===\n`)
+
+    // --- Exit-code mapping from the host-side run state ---
+    // 0 = clean sync, 2 = sync completed but needs human attention.
+    // A cron wrapper can use this to decide whether to notify the owner.
+    const outcome = runState.reportOutcome
+    const needsAttention =
+      (outcome !== null &&
+        (outcome.needsHumanReview || outcome.blockedCount > 0 || outcome.unaccountedCount > 0)) ||
+      runState.validations.some((v) => !v.allPassed) ||
+      runState.gateEvents.length > 0
+    if (needsAttention) {
+      process.exitCode = 2
+      process.stderr.write(
+        `[Outcome] Run needs human attention (exit code 2)` +
+          (outcome
+            ? `: needsHumanReview=${outcome.needsHumanReview}, blocked=${outcome.blockedCount}, unaccounted=${outcome.unaccountedCount}, gateEvents=${runState.gateEvents.length}\n`
+            : `: validation failed or host gates fired before a report was generated\n`),
+      )
+    }
+
     if (result.outputText) {
       // The run may complete via generate_report (JSON output) or submit_and_exit (plain text).
       // Try to extract the Markdown report from JSON; fall back to plain text.
@@ -392,6 +412,8 @@ async function main() {
         console.error(`\n=== Run complete (context-limit abort) ===\n`)
         console.error("[Context] Run aborted due to context limit — partial report generated; checkpoint preserved for next run.")
         console.log(reportMarkdown)
+        // A context-limit abort always needs human attention (some commits deferred).
+        process.exitCode = 2
       } catch {
         // If partial report generation fails, re-throw the original abort error.
         throw runErr
@@ -433,7 +455,8 @@ async function main() {
 // Wrap main() in a .catch() handler to ensure the process exits with code 1
 // on any unhandled error, rather than crashing with an unhandled rejection.
 main()
-  .then(() => process.exit(0))
+  // Preserve the exit code set from the run outcome (0 clean, 2 needs attention).
+  .then(() => process.exit(process.exitCode ?? 0))
   .catch((err) => {
     const errorMessage = err instanceof Error ? err.message : String(err)
     console.error("Fatal error:", errorMessage)
