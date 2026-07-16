@@ -627,10 +627,28 @@ export function makeAiTools(
         ? `\nFork customisation context:\n${resolvedCustomizationNote}\n`
         : ""
 
+      // Detect an upstream file deletion: THEIRS is empty while the file existed
+      // at the merge base. Plain empty-string THEIRS is otherwise indistinguishable
+      // from "upstream made no changes" or "file is genuinely empty" — a real
+      // incident had a sub-agent read this as "upstream never touched the file"
+      // and return the fork's stale version verbatim with "confidence": "high",
+      // reintroducing dead types/imports that had just been deleted upstream and
+      // silently breaking `tsc --noEmit`.
+      const theirsAppearsDeleted = theirContent.trim() === "" && baseContent.trim() !== ""
+      const deletionNote = theirsAppearsDeleted
+        ? "\nIMPORTANT: THEIRS is empty because the upstream commit DELETED this file entirely " +
+          "(it is not merely unchanged or short). Decide whether the fork's customisations in " +
+          "OURS are worth preserving under a different resolution, or whether this file should " +
+          "also be deleted to match upstream intent. Set \"confidence\" to \"low\" or \"medium\" " +
+          "for this decision — never \"high\" — since keeping vs. deleting a file upstream removed " +
+          "is a judgment call a human should double-check.\n"
+        : ""
+
       const userPrompt =
         `Resolve the merge conflict in file: ${filePath}\n` +
         `Upstream commit message: ${commitMessage}\n` +
         customizationSection +
+        deletionNote +
         `\n--- BASE (common ancestor) ---\n${baseContent || "(file did not exist at merge base)"}\n` +
         `\n--- OURS (fork version) ---\n${ourContent}\n` +
         `\n--- THEIRS (upstream version) ---\n${theirContent}\n` +
@@ -706,6 +724,22 @@ export function makeAiTools(
             })
             process.stderr.write(
               `[resolve_conflict_with_ai] GUARD: syntax check failed for ${filePath}: ${syntaxCheck.issue} — downgrading confidence to low\n`,
+            )
+          }
+
+          // --- Deletion guard: never trust "high" confidence when THEIRS deleted the
+          // file. The deletion-vs-keep decision is inherently a judgment call, and the
+          // model's own confidence label is not a reliable signal here (see deletionNote
+          // above) — cap it host-side regardless of what the model reports.
+          if (theirsAppearsDeleted && effectiveConfidence === "high") {
+            effectiveConfidence = "medium"
+            guards.push("theirs_deleted_high_confidence_capped")
+            logAuditEvent(logPath, "resolve_conflict_with_ai", "theirs_deleted_high_confidence_capped", {
+              filePath,
+              modelId,
+            })
+            process.stderr.write(
+              `[resolve_conflict_with_ai] GUARD: upstream deleted ${filePath}; capping "high" confidence to "medium"\n`,
             )
           }
 

@@ -59,7 +59,7 @@ import { createOrUpdateSyncPr } from "../github/github-tools.js";
 import { Agent } from "@sctg/cline-sdk";
 import { defineTool } from "../tool-helper.js";
 import type { SyncConfig } from "../config/schema.js";
-import { validationFailed, type RunState } from "../agent/run-state.js";
+import { validationFailed, validationRan, type RunState } from "../agent/run-state.js";
 
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -347,9 +347,21 @@ export function makeReportTool(
       // validation suite reported as a clean sync).  A run with a failed
       // validation or any host-gate activation can never be presented as clean.
       const hostValidationFailed = runState ? validationFailed(runState) : false
+      // Observed in a real run: a commit was cherry-picked and applied while
+      // run_validation was never called at all (0 validation records), which
+      // validationFailed() cannot distinguish from "validation ran and passed"
+      // since .some() on an empty array is false. Applying any commit without
+      // ever validating is the same blind spot as a failed validation.
+      const hostValidationSkippedWithAppliedCommits =
+        runState != null && applied.length > 0 && !validationRan(runState)
       const hostGateEvents = runState?.gateEvents ?? []
-      const allPassed = needsReview.length === 0 && !hostValidationFailed
-      const needsHumanReview = needsReview.length > 0 || hostValidationFailed || hostGateEvents.length > 0
+      const allPassed =
+        needsReview.length === 0 && !hostValidationFailed && !hostValidationSkippedWithAppliedCommits
+      const needsHumanReview =
+        needsReview.length > 0 ||
+        hostValidationFailed ||
+        hostValidationSkippedWithAppliedCommits ||
+        hostGateEvents.length > 0
 
       // --- Accountability check: detect silently dropped commits ---
       const processedShas = new Set([
@@ -377,16 +389,25 @@ export function makeReportTool(
         `- ⛔ Blocked (not attempted): ${blockedCommits.length}`,
         ...(unaccounted.length > 0 ? [`- 🔴 Unaccounted (agent bug): ${unaccounted.length}`] : []),
         ...(hostValidationFailed ? ["- 🔴 Validation suite FAILED during this run (host-verified)"] : []),
+        ...(hostValidationSkippedWithAppliedCommits
+          ? ["- 🔴 Commits were applied but run_validation was never called during this run (host-verified)"]
+          : []),
         "",
       ]
 
-      if (hostValidationFailed || hostGateEvents.length > 0) {
+      if (hostValidationFailed || hostValidationSkippedWithAppliedCommits || hostGateEvents.length > 0) {
         prBodyLines.push("### 🛑 Host-side gate report", "")
         if (hostValidationFailed) {
           const failedLevels = (runState?.validations ?? []).filter((v) => !v.allPassed).map((v) => v.level)
           prBodyLines.push(
             `- Validation suite(s) FAILED: ${failedLevels.join(", ")} — this run requires human review ` +
               "regardless of per-commit statuses above.",
+          )
+        }
+        if (hostValidationSkippedWithAppliedCommits) {
+          prBodyLines.push(
+            `- ${applied.length} commit(s) were applied but run_validation was never invoked — this run ` +
+              "requires human review regardless of per-commit statuses above.",
           )
         }
         for (const event of hostGateEvents) prBodyLines.push(`- ${event}`)
