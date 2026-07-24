@@ -34,9 +34,9 @@
   },
   "dependencies": {
     "@octokit/rest": "^22.0.1",
-    "@sctg/cline-sdk": "4.0.0-beta.20260719083641",
+    "@sctg/cline-sdk": "4.0.0-beta.20260724065706",
     "dotenv": "^17.4.2",
-    "js-yaml": "^5.2.1",
+    "js-yaml": "^5.2.2",
     "minimatch": "^10.0.1",
     "tiktoken": "^1.0.22",
     "zod": "^4.4.3"
